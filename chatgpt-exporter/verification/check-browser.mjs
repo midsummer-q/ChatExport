@@ -49,6 +49,7 @@ body{margin:0;background:#fff;color:#171717;font:16px system-ui}aside{position:f
 const browser = await chromium.launch({ channel: 'msedge', headless: true })
 try {
     const context = await browser.newContext({ viewport: { width: 1280, height: 960 }, acceptDownloads: true })
+    await context.addCookies([{ name: '_account', value: 'personal', url: 'https://chatgpt.com' }])
     let injectedFailure = false
     const listOffsets = []
     const projectCursors = []
@@ -58,6 +59,8 @@ try {
         const respond = (data, status = 200) => route.fulfill({ status, contentType: 'application/json', body: JSON.stringify(data) })
         if (url.pathname.startsWith('/c/')) return route.fulfill({ contentType: 'text/html', body: shell })
         assert.equal(route.request().method(), 'GET', 'verification must never mutate conversations')
+        assert.equal(route.request().headers()['chatgpt-account-id'], undefined, 'personal exports must not send a team header')
+        assert.ok(!url.pathname.includes('/accounts/check/'), 'personal cookie must not trigger a team lookup')
         if (url.pathname === '/api/auth/session') return respond({ accessToken: 'synthetic-test-token' })
         if (url.pathname === '/backend-api/gizmos/snorlax/sidebar') {
             return respond({ items: [{ gizmo: { gizmo: { id: 'project-demo', organization_id: 'test', display: { name: '项目分页测试', description: '' } } } }], cursor: null })
@@ -101,6 +104,7 @@ try {
     await page.addScriptTag({ path: join(root, 'dist', 'chatgpt.user.js') })
     await page.getByRole('button', { name: '导出助手', exact: true }).click()
     await page.getByRole('button', { name: '批量导出', exact: true }).click()
+    assert.match(await page.locator('.ce-export-source').textContent(), /从 API 导出/)
     const rows = page.locator('.ce-select-list input[type="checkbox"]')
     await page.locator('.ce-load-more button').waitFor()
     assert.equal(await rows.count(), 40)
@@ -158,6 +162,7 @@ try {
     await preview.screenshot({ path: join(output, 'chatgpt-thinking.png'), fullPage: true })
     const report = {
         syntheticDataOnly: true,
+        personalWorkspaceCookie: 'passed',
         totalConversations: 137,
         listOffsets,
         projectCursors,

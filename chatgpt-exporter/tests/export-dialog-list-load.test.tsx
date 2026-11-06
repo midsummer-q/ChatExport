@@ -189,6 +189,22 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('export All conversation-list load', () => {
+    it('loads personal account history and labels it as an API export', async () => {
+        document.cookie = '_account=personal; path=/'
+        try {
+            const fetchMock = stubApi({ list: [page([item('personal-chat')])] })
+            await openDialog()
+            expect(conversationTitles()).toEqual(['personal-chat'])
+            expect(listError()).toBe('')
+            expect(document.querySelector('.ce-export-source')?.textContent).toContain('Export from API')
+            expect(document.querySelector('.ce-export-source')?.textContent).not.toContain('conversations.json')
+            expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/accounts/check/'))).toBe(false)
+        }
+        finally {
+            document.cookie = '_account=; Max-Age=0; path=/'
+        }
+    })
+
     it('retries a failed later page with Load more and clears the error', async () => {
         const first = Array.from({ length: 50 }, (_, i) => item(`c${i}`))
         const fetchMock = stubApi({ list: [page(first, 51), tooManyRequests('2'), page([item('last')], 51)] })

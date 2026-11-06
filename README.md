@@ -8,7 +8,7 @@ ChatGPT 与 DeepSeek 对话导出脚本合集。支持单篇与批量导出，�
 
 | 项目 | 版本 | 安装脚本 | 使用说明 |
 | --- | --- | --- | --- |
-| ChatGPT Exporter | 0.1.0 | [chatgpt.user.js](chatgpt-exporter/dist/chatgpt.user.js) | [说明](chatgpt-exporter/README.md) |
+| ChatGPT Exporter | 0.1.1 | [chatgpt.user.js](chatgpt-exporter/dist/chatgpt.user.js) | [说明](chatgpt-exporter/README.md) |
 | DeepSeek Exporter | 0.1.4 | [deepseek.user.js](deepseek-exporter/dist/deepseek.user.js) | [说明](deepseek-exporter/README.md) |
 
 安装 Tampermonkey 后，在其管理面板中选择“实用工具 → 从文件导入”，导入对应的 `.user.js` 文件，随后刷新已登录的网站。两个平台的脚本可以同时启用；同一个平台只保留一个导出脚本版本。
@@ -74,7 +74,7 @@ npm run build
 
 ## 验证范围
 
-整理时复查了两个项目的 TypeScript、自动测试、代码规范与生产构建：ChatGPT 170 项测试，DeepSeek 42 项测试。此前浏览器验证使用合成数据，包括 ChatGPT 的 137 条历史记录分页及 ZIP 下载、DeepSeek 的思考内容排版。上述结果不代表已在所有真实账号上完成端到端验证。
+整理时复查了两个项目的 TypeScript、自动测试、代码规范与生产构建：ChatGPT 176 项测试，DeepSeek 42 项测试。此前浏览器验证使用合成数据，包括 ChatGPT 的 137 条历史记录分页及 ZIP 下载、DeepSeek 的思考内容排版。上述结果不代表已在所有真实账号上完成端到端验证。
 
 ## 来源与许可证
 

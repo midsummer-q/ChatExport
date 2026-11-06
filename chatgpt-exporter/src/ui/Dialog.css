@@ -289,6 +289,13 @@
     overflow: hidden;
 }
 
+.ce-select-error {
+    display: block;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    height: auto;
+}
+
 .ce-select-item-empty {
     color: var(--ce-text-tertiary);
 }

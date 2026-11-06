@@ -174,6 +174,40 @@ describe('local adapter session handling', () => {
         expect(fetchMock).toHaveBeenCalledTimes(2)
     })
 
+    it.each(['personal', '%70ersonal'])('loads personal history for cookie %s without a team lookup', async (cookie) => {
+        vi.stubGlobal('document', { cookie: `_account=${cookie}` })
+        const fetchMock = serve((url, init) => {
+            expect(url.pathname).not.toContain('/accounts/check/')
+            expect(new Headers(init?.headers).has('Chatgpt-Account-Id')).toBe(false)
+            return json({ items: items(1), total: 1 })
+        })
+        expect(await api.fetchAllConversations()).toHaveLength(1)
+        expect(fetchMock).toHaveBeenCalledTimes(2)
+    })
+
+    it('matches a decoded account ID when the account map uses an alias', async () => {
+        vi.stubGlobal('document', { cookie: '_account=team%2Daccount' })
+        serve((url, init) => {
+            if (url.pathname.includes('/accounts/check/')) return json({ accounts: { alias: { account: { account_id: 'team-account' } } } })
+            expect(new Headers(init?.headers).get('Chatgpt-Account-Id')).toBe('team-account')
+            return json({ items: [], total: 0 })
+        })
+        expect(await api.fetchAllConversations()).toEqual([])
+    })
+
+    it('does not silently switch an unknown workspace to another account', async () => {
+        vi.stubGlobal('document', { cookie: '_account=unknown' })
+        const fetchMock = serve(() => json({ accounts: { default: { account: { account_id: null, structure: 'personal' } }, other: { account: { account_id: 'other-team' } } } }))
+        await expect(api.fetchAllConversations()).rejects.toThrow('Unable to identify')
+        expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/conversations'))).toBe(false)
+    })
+
+    it('rejects malformed workspace responses with a useful error', async () => {
+        vi.stubGlobal('document', { cookie: '_account=team-account' })
+        serve(() => json({ accounts: null }))
+        await expect(api.fetchAllConversations()).rejects.toThrow('invalid workspace list')
+    })
+
     it('uses the selected workspace account id', async () => {
         vi.stubGlobal('document', { cookie: '_account=workspace-1' })
         serve((url, init) => {

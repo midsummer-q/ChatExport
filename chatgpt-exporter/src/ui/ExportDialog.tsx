@@ -328,7 +328,7 @@ const ConversationSelect: FC<ConversationSelectProps> = ({
             {/* ── Conversation list ── */}
             <ul className="ce-select-list">
                 {loading && conversations.length === 0 && <li className="ce-select-item">{t('Loading')}...</li>}
-                {error && <li className="ce-select-item">{t('Error')}: {error}</li>}
+                {error && <li role="alert" className="ce-select-item ce-select-error">{t('Error')}: {error}</li>}
                 {filtered.map((c, index) => {
                     const isSelected = selected.some(x => x.id === c.id)
                     return (
@@ -789,7 +789,7 @@ const DialogContent: FC<DialogContentProps> = ({ format, onClose }) => {
     return (
         <>
             <div className="ce-export-source">
-                {t('Export from official export file')} (conversations.json)&nbsp;
+                {exportSource === 'API' ? t('Export from API') : `${t('Export from official export file')} (conversations.json)`}
                 <div className="ce-hstack">
                     {exportSource === 'API' && (
                         <button

@@ -986,17 +986,35 @@ function fetchAccountsCheck(token: string): Promise<ApiAccountsCheck> {
 const getCookie = (key: string) => document.cookie.match(`(^|;)\\s*${key}\\s*=\\s*([^;]+)`)?.pop() || ''
 
 export async function getTeamAccountId(): Promise<string | null> {
-    const workspaceId = getCookie(ChatGPTCookie.Workspace)
-    if (workspaceId) {
-        const accountsCheck = await fetchAccountsCheck(await getAccessToken())
-        const account = accountsCheck.accounts[workspaceId]
-        if (account) {
-            return account.account.account_id
-        }
-        throw new Error('Unable to identify the current ChatGPT workspace. Refresh the page before exporting.')
+    const rawWorkspaceId = getCookie(ChatGPTCookie.Workspace)
+    let workspaceId = rawWorkspaceId
+    try {
+        workspaceId = decodeURIComponent(rawWorkspaceId)
+    }
+    catch {
+        // A malformed cookie must not silently select a different workspace.
     }
 
-    return null
+    // Personal accounts use this sentinel rather than a key in accounts/check.
+    // Omit the team header and let the signed-in personal session handle it.
+    if (!workspaceId || workspaceId === 'personal') return null
+
+    const { accounts } = await fetchAccountsCheck(await getAccessToken())
+    if (!accounts || typeof accounts !== 'object' || Array.isArray(accounts)) {
+        throw new Error('ChatGPT returned an invalid workspace list. Refresh the page and retry.')
+    }
+    // Some responses key the map by an alias rather than the actual account ID.
+    const entry = Object.prototype.hasOwnProperty.call(accounts, workspaceId)
+        ? accounts[workspaceId]
+        : Object.values(accounts).find(item => item?.account?.account_id === workspaceId)
+    const account = entry?.account
+    if (typeof account?.account_id === 'string' && account.account_id) {
+        return account.account_id
+    }
+    if (account?.structure === 'personal') return null
+
+    // Never fall back to another workspace or the first account in the list.
+    throw new Error('Unable to identify the current ChatGPT workspace. Select your workspace again in ChatGPT, refresh the page, and retry.')
 }
 
 export interface ConversationResult {
