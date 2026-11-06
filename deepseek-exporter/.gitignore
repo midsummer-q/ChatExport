@@ -1,0 +1,15 @@
+node_modules/
+*.log
+*.local
+.turbo/
+.vite/
+coverage/
+tsconfig.tsbuildinfo
+.DS_Store
+.idea/
+.vscode/
+verification/output/
+verification/thinking-format/*.png
+verification/thinking-format/*.html
+verification/thinking-format/*.md
+verification/thinking-format/browser-check.json

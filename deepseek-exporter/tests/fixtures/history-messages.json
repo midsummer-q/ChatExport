@@ -1,0 +1,123 @@
+{
+  "id": "session-1",
+  "title": "Exporter fixture",
+  "create_time": 1775290400,
+  "update_time": 1775290500,
+  "chat_session": {
+    "id": "session-1",
+    "title": "Exporter fixture",
+    "model_type": "deepseek_reasoner",
+    "inserted_at": 1775290400,
+    "updated_at": 1775290500,
+    "current_message_id": "a2"
+  },
+  "chat_messages": [
+    {
+      "message_id": "u1",
+      "parent_id": null,
+      "role": "USER",
+      "status": "FINISHED",
+      "inserted_at": 1775290400,
+      "fragments": [
+        {
+          "type": "REQUEST",
+          "content": "Explain the current API."
+        }
+      ]
+    },
+    {
+      "message_id": "a-old",
+      "parent_id": "u1",
+      "role": "ASSISTANT",
+      "status": "FINISHED",
+      "inserted_at": 1775290410,
+      "fragments": [
+        {
+          "type": "RESPONSE",
+          "content": "This regenerated branch is not selected."
+        }
+      ]
+    },
+    {
+      "message_id": "a-current",
+      "parent_id": "u1",
+      "role": "ASSISTANT",
+      "status": "FINISHED",
+      "inserted_at": 1775290420,
+      "fragments": [
+        {
+          "type": "RESPONSE",
+          "content": "This is the selected branch."
+        }
+      ]
+    },
+    {
+      "message_id": "u2",
+      "parent_id": "a-current",
+      "role": "USER",
+      "status": "FINISHED",
+      "inserted_at": 1775290430,
+      "files": [
+        {
+          "file_name": "diagram.png",
+          "signed_path": "/api/v0/file/diagram.png",
+          "mime_type": "image/png",
+          "width": 640,
+          "height": 480,
+          "file_size": 12345
+        }
+      ],
+      "fragments": [
+        {
+          "type": "REQUEST",
+          "content": "Use this diagram and search the web."
+        }
+      ]
+    },
+    {
+      "message_id": "a2",
+      "parent_id": "u2",
+      "role": "ASSISTANT",
+      "model": "deepseek-reasoner",
+      "thinking_enabled": true,
+      "status": "FINISHED",
+      "inserted_at": 1775290500,
+      "fragments": [
+        {
+          "type": "THINK",
+          "content": "I should verify the primary source.",
+          "elapsed_secs": 12
+        },
+        {
+          "type": "TOOL_SEARCH",
+          "results": [
+            {
+              "cite_index": 0,
+              "title": "DeepSeek",
+              "url": "https://www.deepseek.com/",
+              "site_name": "DeepSeek"
+            },
+            {
+              "cite_index": 1,
+              "title": "DeepSeek API Docs",
+              "url": "https://api-docs.deepseek.com/",
+              "site_name": "DeepSeek Docs"
+            }
+          ]
+        },
+        {
+          "type": "TOOL_OPEN",
+          "result": {
+            "cite_index": 0,
+            "title": "DeepSeek",
+            "url": "https://www.deepseek.com/"
+          }
+        },
+        {
+          "type": "RESPONSE",
+          "content": "The primary source confirms it.[reference:0]"
+        }
+      ]
+    }
+  ]
+}

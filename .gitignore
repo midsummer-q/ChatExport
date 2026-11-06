@@ -1,0 +1,22 @@
+# Dependencies and generated checks
+**/node_modules/
+**/.vite/
+**/.turbo/
+**/coverage/
+*.log
+*.tsbuildinfo
+**/verification/output/
+**/verification/thinking-format/*.png
+**/verification/thinking-format/*.html
+**/verification/thinking-format/*.md
+**/verification/thinking-format/browser-check.json
+
+# Local configuration
+.env
+.env.*
+!.env.example
+*.local
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

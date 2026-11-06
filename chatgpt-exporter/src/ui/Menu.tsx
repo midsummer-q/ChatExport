@@ -1,0 +1,250 @@
+import { useCallback, useEffect, useMemo, useState } from 'preact/hooks'
+import { useTranslation } from '../i18n'
+import { exportToHtml } from '../exporter/html'
+import { exportToPng } from '../exporter/image'
+import { exportToJson, exportToOoba, exportToTavern } from '../exporter/json'
+import { exportToMarkdown } from '../exporter/markdown'
+import { exportToText } from '../exporter/text'
+import { useWindowResize } from '../hooks/useWindowResize'
+import { Dialog } from './Dialog'
+import { Divider } from './Divider'
+import { ExportDialog } from './ExportDialog'
+import { HoverCard } from './HoverCard'
+import { FileCode, IconArrowRightFromBracket, IconCamera, IconCopy, IconJSON, IconMarkdown, IconSetting, IconZip } from './Icons'
+import { MenuItem } from './MenuItem'
+import { SettingProvider, useSettingContext } from './SettingContext'
+import { SettingDialog } from './SettingDialog'
+
+import './theme.css'
+import '../style.css'
+import './Dialog.css'
+
+function useCollapsedSidebar(container: HTMLDivElement, isMobile: boolean) {
+    const [isCollapsed, setIsCollapsed] = useState(false)
+
+    useEffect(() => {
+        if (isMobile) {
+            setIsCollapsed(false)
+            return
+        }
+
+        let frame = 0
+        const observed = new Set<Element>()
+        const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(update)
+
+        function sidebarElement() {
+            return container.closest('nav, aside, [aria-label="Sidebar"], [data-testid="sidebar"]')
+                ?? container.parentElement
+        }
+
+        function observe(element: Element | null | undefined) {
+            if (!observer || !element || observed.has(element)) return
+            observer.observe(element)
+            observed.add(element)
+        }
+
+        function update() {
+            cancelAnimationFrame(frame)
+            frame = requestAnimationFrame(() => {
+                const parentWidth = container.parentElement?.getBoundingClientRect().width ?? 0
+                const sidebarWidth = sidebarElement()?.getBoundingClientRect().width ?? parentWidth
+                const nextCollapsed = (parentWidth > 0 && parentWidth < 96)
+                    || (sidebarWidth > 0 && sidebarWidth < 96)
+
+                setIsCollapsed(nextCollapsed)
+                container.toggleAttribute('data-ce-sidebar-collapsed', nextCollapsed)
+                observe(container.parentElement)
+                observe(sidebarElement())
+            })
+        }
+
+        observe(container.parentElement)
+        observe(sidebarElement())
+        update()
+
+        window.addEventListener('resize', update)
+        return () => {
+            cancelAnimationFrame(frame)
+            window.removeEventListener('resize', update)
+            observer?.disconnect()
+            container.removeAttribute('data-ce-sidebar-collapsed')
+        }
+    }, [container, isMobile])
+
+    return isCollapsed
+}
+
+function MenuInner({ container }: { container: HTMLDivElement }) {
+    const { t } = useTranslation()
+
+    const [open, setOpen] = useState(false)
+    const [jsonOpen, setJsonOpen] = useState(false)
+    const [exportOpen, setExportOpen] = useState(false)
+    const [settingOpen, setSettingOpen] = useState(false)
+
+    const {
+        format,
+        enableTimestamp,
+        timeStamp24H,
+        enableMeta,
+        exportMetaList,
+    } = useSettingContext()
+
+    useEffect(() => {
+        if (enableTimestamp) {
+            document.body.setAttribute('data-time-format', timeStamp24H ? '24' : '12')
+        }
+        else {
+            document.body.removeAttribute('data-time-format')
+        }
+    }, [enableTimestamp, timeStamp24H])
+
+    const metaList = useMemo(() => enableMeta ? exportMetaList : [], [enableMeta, exportMetaList])
+
+    const onClickText = useCallback(() => exportToText(), [])
+    const onClickPng = useCallback(() => exportToPng(format), [format])
+    const onClickMarkdown = useCallback(() => exportToMarkdown(format, metaList), [format, metaList])
+    const onClickHtml = useCallback(() => exportToHtml(format, metaList), [format, metaList])
+    const onClickJSON = useCallback(() => {
+        setJsonOpen(true)
+        return false
+    }, [])
+    const onClickSetting = useCallback(() => {
+        setSettingOpen(true)
+        return false
+    }, [])
+    const onClickExportAll = useCallback(() => {
+        setExportOpen(true)
+        return false
+    }, [])
+    const onClickOfficialJSON = useCallback(() => exportToJson(format), [format])
+    const onClickTavern = useCallback(() => exportToTavern(format), [format])
+    const onClickOoba = useCallback(() => exportToOoba(format), [format])
+
+    const width = useWindowResize(() => window.innerWidth)
+    const isMobile = width < 768
+    const isCollapsedSidebar = useCollapsedSidebar(container, isMobile)
+
+    return (
+        <>
+            {isMobile && open && (
+                <div
+                    className="ce-backdrop"
+                    onClick={() => setOpen(false)}
+                >
+                </div>
+            )}
+
+            <HoverCard
+                open={open}
+                onOpenChange={setOpen}
+                keepMounted={jsonOpen || settingOpen || exportOpen}
+                isMobile={isMobile}
+                width={isMobile ? 316 : 292}
+                trigger={(
+                    <MenuItem
+                        className={isCollapsedSidebar
+                            ? 'ce-nav-trigger ce-nav-trigger-collapsed'
+                            : 'ce-nav-trigger ce-nav-trigger-expanded'}
+                        text={t('ExportHelper')}
+                        ariaLabel={t('ExportHelper')}
+                        icon={IconArrowRightFromBracket}
+                        onClick={() => {
+                            setOpen(true)
+                            return true
+                        }}
+                    />
+                )}
+            >
+                <MenuItem
+                    text={t('Setting')}
+                    icon={IconSetting}
+                    className="ce-row-full"
+                    onClick={onClickSetting}
+                />
+                <SettingDialog
+                    open={settingOpen}
+                    onOpenChange={setSettingOpen}
+                />
+
+                <MenuItem
+                    text={t('Copy Text')}
+                    successText={t('Copied!')}
+                    icon={IconCopy}
+                    className="ce-row-full"
+                    onClick={onClickText}
+                />
+                <MenuItem
+                    text={t('Screenshot')}
+                    icon={IconCamera}
+                    className="ce-row-half"
+                    onClick={onClickPng}
+                />
+                <MenuItem
+                    text={t('Markdown')}
+                    icon={IconMarkdown}
+                    className="ce-row-half"
+                    onClick={onClickMarkdown}
+                />
+                <MenuItem
+                    text={t('HTML')}
+                    icon={FileCode}
+                    className="ce-row-half"
+                    onClick={onClickHtml}
+                />
+                <MenuItem
+                    text={t('JSON')}
+                    icon={IconJSON}
+                    className="ce-row-half"
+                    onClick={onClickJSON}
+                />
+                <Dialog
+                    open={jsonOpen}
+                    onOpenChange={setJsonOpen}
+                    title={t('JSON')}
+                    style={{ width: '320px' }}
+                >
+                    <MenuItem
+                        text={t('OpenAI Official Format')}
+                        icon={IconCopy}
+                        className="ce-row-full"
+                        onClick={onClickOfficialJSON}
+                    />
+                    <MenuItem
+                        text="JSONL (TavernAI, SillyTavern)"
+                        icon={IconCopy}
+                        className="ce-row-full"
+                        onClick={onClickTavern}
+                    />
+                    <MenuItem
+                        text="Ooba (text-generation-webui)"
+                        icon={IconCopy}
+                        className="ce-row-full"
+                        onClick={onClickOoba}
+                    />
+                </Dialog>
+
+                <MenuItem
+                    text={t('Export All')}
+                    icon={IconZip}
+                    className="ce-row-full"
+                    onClick={onClickExportAll}
+                />
+                <ExportDialog
+                    format={format}
+                    open={exportOpen}
+                    onOpenChange={setExportOpen}
+                />
+            </HoverCard>
+            {!isCollapsedSidebar && <Divider />}
+        </>
+    )
+}
+
+export function Menu({ container }: { container: HTMLDivElement }) {
+    return (
+        <SettingProvider>
+            <MenuInner container={container} />
+        </SettingProvider>
+    )
+}

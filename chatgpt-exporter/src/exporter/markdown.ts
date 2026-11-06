@@ -1,0 +1,287 @@
+import JSZip from 'jszip'
+import { fetchConversation, getCurrentChatId, getFileAttachmentNames, processConversation, shouldSkipMessageInExport, withImageAssets } from '../api'
+import { KEY_SOURCES_ENABLED, KEY_THINKING_ENABLED, KEY_TIMESTAMP_24H, KEY_TIMESTAMP_ENABLED, KEY_TIMESTAMP_MARKDOWN, baseUrl } from '../constants'
+import i18n from '../i18n'
+import { checkIfConversationStarted } from '../page'
+import { checkIfTemporaryChatIsExportable } from '../temporaryChat'
+import { transformContentReferences } from '../utils/citations'
+import { buildZipFileName, downloadFile, getFileNameWithFormat } from '../utils/download'
+import { addImageFilesToZip, extractImageFiles, getImageMode } from '../utils/imageFiles'
+import { protectMath } from '../utils/latex'
+import { formatDurationSeconds } from '../utils/duration'
+import { fromMarkdown, toMarkdown } from '../utils/markdown'
+import { ScriptStorage } from '../utils/storage'
+import { standardizeLineBreaks } from '../utils/text'
+import { transformAuthor } from '../utils/author'
+import type { ApiConversation, ApiConversationWithId, Citation, ConversationNodeMessage, ConversationResult, ThinkingContent } from '../api'
+import type { ExportMeta, ImageMode } from '../ui/SettingContext'
+import type { PartInfo } from '../utils/download'
+import { getMetaVariables, resolveMetaList } from './meta'
+
+/** Omitted images skip the download, the other modes need the image data */
+function loadImages<T extends ApiConversation>(conversation: T, imageMode: ImageMode): Promise<T> {
+    return imageMode === 'omit' ? Promise.resolve(conversation) : withImageAssets(conversation)
+}
+
+export async function exportToMarkdown(fileNameFormat: string, metaList: ExportMeta[]) {
+    if (!checkIfConversationStarted()) {
+        alert(i18n.t('Please start a conversation first'))
+        return false
+    }
+
+    if (!checkIfTemporaryChatIsExportable()) {
+        alert(i18n.t('Temporary chat could not be captured'))
+        return false
+    }
+
+    const chatId = await getCurrentChatId()
+    const imageMode = getImageMode()
+    const assets = new Map<string, string>()
+    let rawConversation = await loadImages(await fetchConversation(chatId), imageMode)
+    if (imageMode === 'files') rawConversation = await extractImageFiles(rawConversation, assets)
+    const enableThinking = ScriptStorage.get<boolean>(KEY_THINKING_ENABLED) ?? false
+    const conversation = processConversation(rawConversation, { enableThinking })
+    const markdown = standardizeLineBreaks(conversationToMarkdown(conversation, metaList, imageMode))
+
+    const fileName = getFileNameWithFormat(fileNameFormat, 'md', { title: conversation.title, chatId, createTime: conversation.createTime, updateTime: conversation.updateTime })
+    // A conversation without images stays a plain Markdown file
+    if (assets.size === 0) {
+        downloadFile(fileName, 'text/markdown', markdown)
+        return true
+    }
+
+    const zip = new JSZip()
+    zip.file(fileName, markdown)
+    addImageFilesToZip(zip, assets)
+    downloadFile(fileName.replace(/\.md$/, '.zip'), 'application/zip', await generateZip(zip))
+
+    return true
+}
+
+export async function exportAllToMarkdown(fileNameFormat: string, apiConversations: ApiConversationWithId[], metaList?: ExportMeta[], projectName?: string, partIndex?: number, totalParts?: number) {
+    const zip = new JSZip()
+    const filenameMap = new Map<string, number>()
+    const enableThinking = ScriptStorage.get<boolean>(KEY_THINKING_ENABLED) ?? false
+    const imageMode = getImageMode()
+    // Shared by every conversation in the zip, file names are content hashes so they never collide
+    const assets = new Map<string, string>()
+    const rawConversations = imageMode === 'files'
+        ? await Promise.all(apiConversations.map(x => extractImageFiles(x, assets)))
+        : apiConversations
+    const conversations = rawConversations.map(x => processConversation(x, { enableThinking }))
+    conversations.forEach((conversation) => {
+        let fileName = getFileNameWithFormat(fileNameFormat, 'md', {
+            title: conversation.title,
+            chatId: conversation.id,
+            createTime: conversation.createTime,
+            updateTime: conversation.updateTime,
+        })
+        if (filenameMap.has(fileName)) {
+            const count = filenameMap.get(fileName) ?? 1
+            filenameMap.set(fileName, count + 1)
+            fileName = `${fileName.slice(0, -3)} (${count}).md`
+        }
+        else {
+            filenameMap.set(fileName, 1)
+        }
+        const content = conversationToMarkdown(conversation, metaList, imageMode)
+        zip.file(fileName, content)
+    })
+    addImageFilesToZip(zip, assets)
+
+    const blob = await generateZip(zip)
+    const partInfo: PartInfo | undefined = (partIndex != null && totalParts != null)
+        ? { part: partIndex, total: totalParts }
+        : undefined
+    downloadFile(buildZipFileName('markdown', projectName, partInfo), 'application/zip', blob)
+
+    return true
+}
+
+function generateZip(zip: JSZip) {
+    return zip.generateAsync({
+        type: 'blob',
+        // A DOS-made zip makes macOS `unzip` garble non-ASCII file names
+        platform: 'UNIX',
+        compression: 'DEFLATE',
+        compressionOptions: {
+            level: 9,
+        },
+    })
+}
+
+function conversationToMarkdown(conversation: ConversationResult, metaList: ExportMeta[] | undefined, imageMode: ImageMode) {
+    const { id, title, conversationNodes } = conversation
+    const source = `${baseUrl}/c/${id}`
+
+    const _metaList = resolveMetaList(metaList, getMetaVariables(conversation, source))
+        .map(([name, val]) => `${name}: ${val}`)
+    const frontMatter = _metaList.length > 0
+        ? `---\n${_metaList.join('\n')}\n---\n\n`
+        : ''
+
+    const enableTimestamp = ScriptStorage.get<boolean>(KEY_TIMESTAMP_ENABLED) ?? false
+    const timeStampMarkdown = ScriptStorage.get<boolean>(KEY_TIMESTAMP_MARKDOWN) ?? false
+    const timeStamp24H = ScriptStorage.get<boolean>(KEY_TIMESTAMP_24H) ?? false
+    const enableSources = ScriptStorage.get<boolean>(KEY_SOURCES_ENABLED) ?? true
+    // Same placeholder as the text export
+    const renderImage = imageMode === 'omit'
+        ? () => '[image]'
+        : (src: string) => `![image](${src})`
+
+    const content = conversationNodes.map(({ message, thinking }) => {
+        if (!message || !message.content) return null
+
+        if (shouldSkipMessageInExport(message)) return null
+
+        const timestamp = message?.create_time ?? ''
+        const showTimestamp = enableTimestamp && timeStampMarkdown && timestamp
+        let timestampHtml = ''
+        if (showTimestamp) {
+            const date = new Date(timestamp * 1000)
+            // format: 20:12 / 08:12 PM
+            const conversationTime = date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: !timeStamp24H })
+            timestampHtml = `<time datetime="${date.toISOString()}" title="${date.toLocaleString()}">${conversationTime}</time>\n\n`
+        }
+
+        const author = transformAuthor(message.author)
+        const thinkingBlock = thinking ? formatThinkingMarkdown(thinking) : ''
+
+        const postSteps: Array<(input: string) => string> = []
+        if (message.author.role === 'assistant') {
+            // Handle new-style content references (web search citations with Unicode markers)
+            postSteps.push(input => transformContentReferences(input, message.metadata, {
+                includeSourceList: enableSources,
+                sourceListLabel: i18n.t('Sources'),
+            }))
+            // Handle old-style footnotes (【11†(PrintWiki)】 format)
+            postSteps.push(input => transformFootNotes(input, message.metadata))
+        }
+        // Only message from assistant will be reformatted
+        if (message.author.role === 'assistant') {
+            postSteps.push((input) => {
+                // Keep formulas out of the markdown round trip, which would escape them
+                const { text, restore } = protectMath(input)
+                return restore(toMarkdown(fromMarkdown(text), text))
+            })
+        }
+        const postProcess = (input: string) => postSteps.reduce((acc, fn) => fn(acc), input)
+        const content = transformContent(message.content, message.metadata, postProcess, renderImage)
+        const attachments = getFileAttachmentNames(message).map(name => `- 📎 ${name}`).join('\n')
+        const attachmentsBlock = attachments ? `\n\n${attachments}` : ''
+
+        return `#### ${author}:\n${timestampHtml}${thinkingBlock}${content}${attachmentsBlock}`
+    }).filter(Boolean).join('\n\n')
+
+    const markdown = `${frontMatter}# ${title}\n\n${content}`
+
+    return markdown
+}
+
+/**
+ * Transform foot notes in assistant's message
+ */
+function transformFootNotes(
+    input: string,
+    metadata: ConversationNodeMessage['metadata'],
+) {
+    // 【11†(PrintWiki)】
+    const footNoteMarkRegex = /【(\d+)†\((.+?)\)】/g
+
+    const citationList: Citation[] = []
+    const output = input.replace(footNoteMarkRegex, (match, citeIndex, _evidenceText) => {
+        const citation = metadata?.citations?.find(cite => cite.metadata?.extra?.cited_message_idx === +citeIndex)
+        if (citation) {
+            citationList.push(citation)
+            // Use markdown caret to represent foot note ([^1])
+            return `[^${citeIndex}]`
+        }
+
+        return match
+    })
+
+    const citationText = citationList.map((citation) => {
+        const citeIndex = citation.metadata?.extra?.cited_message_idx ?? 1
+        const citeTitle = citation.metadata?.title ?? 'No title'
+        return `[^${citeIndex}]: ${citeTitle}`
+    }).join('\n')
+
+    // Foot notes are placed at the end of the conversation node, not the end of the whole document
+    return `${output}\n\n${citationText}`
+}
+
+/**
+ * Convert the content based on the type of message
+ */
+function transformContent(
+    content: ConversationNodeMessage['content'],
+    metadata: ConversationNodeMessage['metadata'],
+    postProcess: (input: string) => string,
+    renderImage: (src: string) => string,
+) {
+    switch (content.content_type) {
+        case 'text':
+            return postProcess(content.parts?.join('\n') || '')
+        case 'code':
+            return postProcess(`Code:\n\`\`\`\n${content.text}\n\`\`\``)
+        case 'execution_output':
+            if (metadata?.aggregate_result?.messages) {
+                return metadata.aggregate_result.messages
+                    .filter(msg => msg.message_type === 'image')
+                    .map(msg => renderImage(msg.image_url))
+                    .join('\n')
+            }
+            return postProcess(`Result:\n\`\`\`\n${content.text}\n\`\`\`` || '')
+        case 'tether_quote':
+            return postProcess(`> ${content.title || content.text || ''}`)
+        case 'tether_browsing_code':
+            return postProcess('') // TODO: implement
+        case 'tether_browsing_display': {
+            const metadataList = metadata?._cite_metadata?.metadata_list
+            if (Array.isArray(metadataList) && metadataList.length > 0) {
+                return postProcess(metadataList.map(({ title, url }) => `> [${title}](${url})`).join('\n'))
+            }
+            return postProcess('')
+        }
+        case 'multimodal_text': {
+            return content.parts?.map((part) => {
+                if (typeof part === 'string') return postProcess(part)
+                if (part.content_type === 'image_asset_pointer') return renderImage(part.asset_pointer)
+                if (part.content_type === 'audio_transcription') return `[audio] ${part.text}`
+                if (part.content_type === 'audio_asset_pointer') return null
+                if (part.content_type === 'real_time_user_audio_video_asset_pointer') return null
+                return postProcess('[Unsupported multimodal content]')
+            }).join('\n') || ''
+        }
+        default:
+            console.warn('[Exporter] Unsupported Content:', content.content_type, content)
+            return postProcess(`[Unsupported Content: ${content.content_type}]`)
+    }
+}
+
+function formatThinkingMarkdown(thinking: ThinkingContent): string {
+    const duration = thinking.durationSeconds == null ? null : formatDurationSeconds(thinking.durationSeconds)
+    const durationLabel = duration == null ? i18n.t('Thinking') : i18n.t('Thought for {{duration}} seconds', { duration })
+
+    const parts: string[] = []
+
+    if (thinking.activities?.length) {
+        parts.push(thinking.activities.map(a => `- ${a}`).join('\n'))
+    }
+
+    const thoughts = thinking.thoughts
+        .map(t => t.content || t.summary)
+        .filter(Boolean)
+        .map((input) => {
+            const { text, restore } = protectMath(input)
+            return restore(toMarkdown(fromMarkdown(text), text)).trim()
+        })
+        .join('\n\n')
+    if (thoughts) parts.push(thoughts)
+
+    const body = parts.join('\n\n')
+
+    if (!body) return ''
+
+    return `<details>\n<summary>${durationLabel}</summary>\n\n${body}\n\n</details>\n\n`
+}

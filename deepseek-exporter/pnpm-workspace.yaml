@@ -1,0 +1,5 @@
+allowBuilds:
+  unrs-resolver: true
+peerDependencyRules:
+  allowedVersions:
+    "eslint-plugin-react-hooks@4.6.2>eslint": "9"

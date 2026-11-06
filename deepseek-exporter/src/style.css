@@ -1,0 +1,428 @@
+.Select {
+    padding: 0 2rem 0 0.5rem;
+    width: auto;
+    min-width: 7.5rem;
+    border: 1px solid #7b8492;
+    border-radius: 4px;
+    background-color: #fff;
+    box-shadow: none;
+    outline: none;
+}
+
+.dark .Select {
+    background-color: #2f2f2f;
+    color: #fff;
+    border-color: #747d8a;
+}
+
+.Select:focus-visible {
+    border-color: #4c89ff;
+    box-shadow: 0 0 0 2px rgba(76, 137, 255, 0.22);
+}
+
+:host {
+    all: initial;
+    z-index: 2147483000;
+    display: block;
+    --ce-menu-primary: #ffffff;
+    --ce-menu-secondary: #f1f4f9;
+    --ce-border-light: rgba(31, 35, 41, 0.16);
+    --ce-text-primary: #1f2329;
+    --ce-native-hover: color-mix(in srgb, var(--ce-text-primary) 7%, transparent);
+    --ce-native-active: color-mix(in srgb, var(--ce-text-primary) 11%, transparent);
+}
+
+:host([data-role="trigger"][data-placement="floating"]) {
+    position: fixed;
+    left: max(16px, env(safe-area-inset-left));
+    bottom: max(16px, env(safe-area-inset-bottom));
+}
+
+:host([data-role="trigger"][data-placement="native"]) {
+    position: relative;
+    z-index: 10;
+    display: block;
+    flex: 0 0 auto;
+    align-self: stretch;
+    width: auto;
+    min-width: 0;
+    margin: 4px 0 8px;
+}
+
+:host([data-role="portal"]) {
+    position: fixed;
+    inset: 0;
+    z-index: 2147483001;
+    display: block;
+    pointer-events: none;
+}
+
+:host([data-role="portal"]) :where(.ce-menu-panel, .ce-clickout-backdrop, .dropdown-backdrop, .DialogOverlay, .DialogContent) {
+    pointer-events: auto;
+}
+
+:host *,
+:host *::before,
+:host *::after {
+    box-sizing: border-box;
+}
+
+:host h1,
+:host h2,
+:host h3,
+:host p,
+:host dl,
+:host dd,
+:host ul,
+:host ol {
+    margin: 0;
+}
+
+:host ul,
+:host ol {
+    padding: 0;
+    list-style: none;
+}
+
+.deepseek-exporter-shell {
+    color: var(--ce-text-primary);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-size: 16px;
+    line-height: 1.5;
+    text-align: left;
+}
+
+:host :where(button, input, select) {
+    font: inherit;
+    color: inherit;
+}
+
+:host :where(button) {
+    appearance: none;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    cursor: pointer;
+}
+
+:host .ce-nav-trigger {
+    min-width: 148px;
+    height: 42px;
+    margin: 0;
+    padding: 0 14px;
+    gap: 9px;
+    border: 1px solid rgba(76, 137, 255, 0.35);
+    border-radius: 12px;
+    background: var(--ce-menu-primary);
+    box-shadow: 0 8px 24px rgba(31, 35, 41, 0.16);
+}
+
+:host .ce-nav-trigger:hover {
+    background: var(--ce-menu-secondary);
+}
+
+:host([data-placement="native"]) .ce-nav-trigger {
+    width: 100%;
+    min-width: 0;
+    height: 44px;
+    padding: 0 12px;
+    border: 0;
+    border-radius: 12px;
+    background: transparent;
+    box-shadow: none;
+    font-size: 14px;
+    transition: background-color 120ms ease;
+}
+
+:host([data-placement="native"]) .ce-nav-trigger:hover {
+    background: var(--dsw-specific-sidebar-nav-item-hover, var(--ce-native-hover));
+}
+
+:host([data-placement="native"]) .ce-nav-trigger:active {
+    background: var(--ce-native-active);
+}
+
+:host hr {
+    display: none;
+}
+
+@media (max-width: 767px) {
+    :host([data-role="trigger"][data-placement="floating"]) {
+        left: 12px;
+        bottom: 12px;
+    }
+
+}
+
+.dark {
+    --ce-text-primary: #eceff4;
+    --ce-menu-primary: #2A2A2A;
+    --ce-menu-secondary: #21242b;
+    --ce-border-light: rgba(255, 255, 255, .15);
+}
+
+.bg-menu {
+    background-color: var(--ce-menu-primary);
+}
+
+.border-menu {
+    border-color: var(--ce-border-light);
+}
+
+.menu-item {
+    height: 46px;
+    width: 100%;
+    min-width: 0;
+    padding: 0 12px;
+    justify-content: flex-start;
+    border: 1px solid var(--ce-border-light);
+    color: var(--ce-text-primary);
+    background: transparent;
+    text-align: left;
+}
+
+.ce-menu-item-copy {
+    display: flex;
+    min-width: 0;
+    flex: 1;
+    flex-direction: column;
+    line-height: 1.25;
+}
+
+.ce-menu-item-description {
+    overflow: hidden;
+    color: color-mix(in srgb, var(--ce-text-primary) 68%, transparent);
+    font-size: 12px;
+    line-height: 1.35;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.menu-item:hover:not([disabled]) {
+    background: var(--ce-menu-secondary);
+}
+
+/* Inside the dropdown panel, items read as a menu: no per-item borders,
+ * hover background only. Bordered cards remain for standalone contexts
+ * such as the JSON export dialog. */
+.ce-menu-panel .menu-item {
+    height: 42px;
+    border-color: transparent;
+}
+
+.ce-menu-divider {
+    height: 1px;
+    margin: 4px 10px;
+    background: var(--ce-border-light);
+}
+
+.menu-item[disabled] {
+    filter: brightness(0.5);
+    cursor: not-allowed;
+}
+
+.menu-item:focus-visible {
+    outline: 2px solid #4c89ff;
+    outline-offset: 2px;
+}
+
+/* `:host button` deliberately resets host-page button styles. Re-apply the
+ * complete switch appearance here so the unchecked state cannot disappear. */
+:host .toggle-switch {
+    position: relative;
+    flex-shrink: 0;
+    width: 36px;
+    height: 22px;
+    border: 1px solid #8a94a3;
+    border-radius: 9999px;
+    background-color: #d8dde5;
+    box-shadow: inset 0 0 0 1px rgba(31, 35, 41, 0.05);
+    outline: none;
+    cursor: pointer;
+    transition: background-color 120ms ease, border-color 120ms ease, box-shadow 120ms ease;
+}
+
+:host .toggle-switch:hover {
+    background-color: #cbd2dc;
+}
+
+:host .toggle-switch:focus-visible {
+    border-color: #4c89ff;
+    box-shadow: 0 0 0 3px rgba(76, 137, 255, 0.25);
+}
+
+:host .toggle-switch[data-state="checked"] {
+    border-color: #3978ed;
+    background-color: #4c89ff;
+}
+
+:host .toggle-switch-handle {
+    display: block;
+    width: 18px;
+    height: 18px;
+    border-radius: 9999px;
+    background-color: #fff;
+    box-shadow: 0 1px 3px rgba(31, 35, 41, 0.32);
+    transform: translateX(1px);
+    transition: transform 120ms ease;
+    will-change: transform;
+}
+
+:host .toggle-switch-handle[data-state="checked"] {
+    transform: translateX(15px);
+}
+
+:host .dark .toggle-switch {
+    border-color: #747d8a;
+    background-color: #454b55;
+}
+
+:host .dark .toggle-switch:hover {
+    background-color: #535b67;
+}
+
+:host .dark .toggle-switch[data-state="checked"] {
+    border-color: #4c89ff;
+    background-color: #4c89ff;
+}
+
+.ce-nav-trigger {
+    min-width: 0;
+    border: 0;
+    color: var(--ce-text-primary);
+}
+
+.ce-nav-trigger .ce-menu-item-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.ce-menu-root {
+    position: relative;
+}
+
+.ce-menu-panel {
+    position: fixed;
+    z-index: 2;
+    width: 268px;
+    max-height: calc(100vh - 32px);
+    overflow-y: auto;
+    border: 1px solid var(--ce-border-light);
+}
+
+.ce-clickout-backdrop {
+    position: fixed;
+    z-index: 1;
+    inset: 0;
+    background: transparent;
+}
+
+@media (max-width: 767px) {
+    .ce-menu-panel {
+        position: fixed;
+        left: 12px;
+        right: 12px;
+        bottom: 64px;
+        width: auto;
+        max-width: 316px;
+    }
+}
+
+.ce-card {
+    border-radius: 1rem;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12), 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+.dark .ce-card {
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.inputFieldSet {
+    display: block;
+    border-width: 2px;
+    border-style: groove;
+}
+
+.inputFieldSet legend {
+    margin-left: 4px;
+}
+
+.inputFieldSet input {
+    background-color: transparent;
+    box-shadow: none!important;
+}
+
+.row-half {
+    grid-column: auto / span 1;
+}
+
+.row-full {
+    grid-column: auto / span 2;
+}
+
+.dropdown-backdrop {
+    display: block;
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background-color: rgba(0,0,0,.5);
+    animation-name: pointerFadeIn;
+    animation-duration: .3s;
+}
+
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+    }
+    to {
+        opacity: 1;
+    }
+}
+
+@keyframes slideUp {
+    from {
+        transform: translateY(100%);
+    }
+    to {
+        transform: translateY(0);
+    }
+}
+
+@keyframes pointerFadeIn {
+    from {
+        opacity: 0;
+        pointer-events: none;
+    }
+    to {
+        opacity: 1;
+        pointer-events: auto;
+    }
+}
+
+@keyframes rotate {
+    from {
+        transform: rotate(0deg);
+    }
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+@keyframes circularDash {
+    0% {
+        stroke-dasharray: 1px, 200px;
+        stroke-dashoffset: 0;
+    }
+    50% {
+        stroke-dasharray: 100px, 200px;
+        stroke-dashoffset: -15px;
+    }
+    100% {
+        stroke-dasharray: 100px, 200px;
+        stroke-dashoffset: -125px;
+    }
+}

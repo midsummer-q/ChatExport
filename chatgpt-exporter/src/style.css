@@ -1,0 +1,152 @@
+.ce-timestamp {
+    display: block;
+    width: 100%;
+    font-size: 0.875rem;
+    line-height: 1.25rem;
+    text-align: right;
+    color: var(--ce-text-tertiary);
+}
+
+span[data-time-format] {
+    display: none;
+}
+
+body[data-time-format="12"] span[data-time-format="12"] {
+    display: inline;
+}
+
+body[data-time-format="24"] span[data-time-format="24"] {
+    display: inline;
+}
+
+.ce-menu-item {
+    display: flex;
+    flex-shrink: 0;
+    align-items: center;
+    gap: 12px;
+    height: 46px;
+    border: 1px solid var(--ce-menu-border);
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background-color 0.2s;
+}
+
+.ce-menu-item[disabled] {
+    filter: brightness(0.5);
+}
+
+.ce-menu-item:not([disabled]):hover {
+    background-color: var(--ce-hover);
+}
+
+.ce-menu-item-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+}
+
+.ce-nav-trigger {
+    min-width: 0;
+    border: 0;
+    color: var(--ce-text-primary);
+}
+
+/* Mark the trigger while its menu is open, like ChatGPT's selected rail items. */
+[data-state="open"] > .ce-nav-trigger {
+    color: var(--ce-text-primary);
+    background-color: var(--ce-hover);
+}
+
+.ce-nav-trigger .ce-menu-item-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Same box as ChatGPT's sidebar rows, so the icon lines up with theirs. */
+.ce-nav-trigger-expanded {
+    margin: 0 0 8px;
+    padding-inline: 10px;
+}
+
+.ce-nav-trigger-collapsed {
+    width: 32px;
+    height: 32px;
+    margin: 0 auto 0.5rem;
+    padding: 0;
+    justify-content: center;
+    gap: 0;
+    border-radius: 8px;
+    color: var(--ce-text-secondary);
+}
+
+.ce-nav-trigger-collapsed .ce-menu-item-text {
+    display: none;
+}
+
+.ce-divider {
+    height: 1px;
+    background-color: var(--ce-border-light);
+}
+
+.ce-card {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 4px;
+    padding: 8px;
+    color: var(--ce-text-primary);
+    background-color: var(--ce-menu-surface);
+    border-radius: 1rem;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12), 0 2px 8px rgba(0, 0, 0, 0.08);
+    transition: opacity 0.2s;
+    animation: ce-fade-in 0.3s;
+}
+
+.ce-card-mobile {
+    animation: ce-slide-up 0.3s;
+}
+
+:is(.dark, [data-theme="dark"]) .ce-card {
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.ce-card .ce-menu-item {
+    column-gap: 8px;
+    padding-inline: 8px;
+}
+
+.ce-dialog .ce-menu-item {
+    padding-inline-start: 8px;
+}
+
+/* HoverCard sets left/top. ChatGPT's main column carries its own z-index,
+   so raise the card above it. Dialogs sit in the top layer, above this. */
+.ce-card {
+    position: fixed;
+    z-index: 999;
+}
+
+.ce-card-arrow {
+    position: absolute;
+    left: -8px;
+    fill: var(--ce-menu-arrow);
+    stroke: var(--ce-menu-border);
+}
+
+.ce-row-half {
+    grid-column: auto / span 1;
+}
+
+.ce-row-full {
+    grid-column: auto / span 2;
+}
+
+.ce-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background-color: rgba(0, 0, 0, 0.5);
+    animation: ce-pointer-fade-in 0.3s;
+}

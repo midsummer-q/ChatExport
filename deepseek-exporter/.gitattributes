@@ -1,0 +1,3 @@
+# Bundled vendor code contains intentional multiline string literals whose tabs
+# appear as trailing whitespace to Git's checker.
+dist/*.user.js -whitespace

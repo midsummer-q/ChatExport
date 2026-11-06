@@ -1,0 +1,967 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks'
+import type { ChangeEvent } from 'preact/compat'
+import i18n, { useTranslation } from '../i18n'
+import { RateLimitError, archiveConversation, deleteConversation, fetchAllConversations, fetchConversation, fetchConversationsPage, fetchProjects, probeApi, withImageAssets } from '../api'
+import { EXPORT_OPERATION_BATCH, KEY_EXPORTED_UPDATE_TIMES } from '../constants'
+import { exportAllToHtml } from '../exporter/html'
+import { exportAllToJson, exportAllToOfficialJson, exportAllToTavern } from '../exporter/json'
+import { exportAllToMarkdown } from '../exporter/markdown'
+import { RequestQueue } from '../utils/queue'
+import { ScriptStorage } from '../utils/storage'
+import { sleep } from '../utils/utils'
+import type { ApiConversationItem, ApiConversationWithId, ApiProjectInfo, ConversationPagePosition } from '../api'
+import type { FC } from '../type'
+import { CheckBox } from './CheckBox'
+import { Dialog } from './Dialog'
+import { IconCross, IconLoading, IconUpload } from './Icons'
+import { useSettingContext } from './SettingContext'
+
+/**
+ * Module-level flag shared between ExportDialog (parent) and DialogContent (child).
+ * Lets the parent gate ESC / outside-click dismissal without lifting state.
+ */
+const exportingRef = { current: false }
+
+/**
+ * Raw conversations fetched by batch exports, kept for the page lifetime so
+ * exporting the same selection again (e.g. in another format) skips the API.
+ * An entry is reused only while the list's `update_time` still matches.
+ */
+const conversationCache = new Map<string, { updateTime: ApiConversationItem['update_time'], conversation: ApiConversationWithId }>()
+
+/** Cap on how many skipped titles the end-of-export alert lists */
+const MAX_SKIPPED_SHOWN = 20
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+
+/**
+ * Normalise create_time / update_time to milliseconds regardless of whether
+ * the API returned an ISO 8601 string (current) or a Unix-seconds number (legacy).
+ */
+function toMs(time: number | string | undefined): number {
+    if (time == null) return 0
+    if (typeof time === 'number') return time * 1000
+    return new Date(time).getTime()
+}
+
+function chunkArray<T>(arr: T[], size: number): T[][] {
+    const result: T[][] = []
+    for (let i = 0; i < arr.length; i += size) {
+        result.push(arr.slice(i, i + size))
+    }
+    return result
+}
+
+/** Compact date label — always includes year to avoid ambiguity */
+function formatConvDate(time: number | string | undefined): string {
+    if (!time) return '—'
+    const ms = typeof time === 'number' ? time * 1000 : new Date(time).getTime()
+    if (Number.isNaN(ms) || ms === 0) return '—'
+    const d = new Date(ms)
+    const diffDays = Math.floor((Date.now() - ms) / 86_400_000)
+    if (diffDays === 0) return 'Today'
+    if (diffDays === 1) return 'Yesterday'
+    // Always show the year so "Jun 17" vs "Jun 17, 2025" confusion is impossible
+    return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })
+}
+
+/** Read the persisted per-conversation last-exported update_time map (conversation id → ms). */
+function getExportedUpdateTimes(): Record<string, number> {
+    const stored = ScriptStorage.get<Record<string, number>>(KEY_EXPORTED_UPDATE_TIMES)
+    if (stored && typeof stored === 'object') return stored
+    return {}
+}
+
+/** Persist the last-exported update_time for conversations that were actually exported successfully. */
+function markExported(conversations: { id: string, update_time?: number | string }[]): void {
+    if (conversations.length === 0) return
+    const map = getExportedUpdateTimes()
+    for (const c of conversations) {
+        const ms = toMs(c.update_time)
+        if (ms > (map[c.id] ?? 0)) map[c.id] = ms
+    }
+    ScriptStorage.set(KEY_EXPORTED_UPDATE_TIMES, map)
+}
+
+/** Text search supporting * and ? wildcards. Falls back to substring. */
+function textSearch(title: string, query: string): boolean {
+    const q = query.trim()
+    if (!q) return true
+    const lower = q.toLowerCase()
+    if (!lower.includes('*') && !lower.includes('?')) {
+        return title.toLowerCase().includes(lower)
+    }
+    const regexStr = lower
+        .replace(/[\\\^$.|+()[\]{}]/g, '\\$&')
+        .replace(/\*/g, '.*')
+        .replace(/\?/g, '.')
+    try {
+        return new RegExp(regexStr).test(title.toLowerCase())
+    }
+    catch {
+        return title.toLowerCase().includes(lower)
+    }
+}
+
+/** Name a wait only when the server sent `Retry-After`, not our own fallback. */
+function describeListLoadError(error: unknown): string {
+    if (error instanceof RateLimitError) {
+        return error.retryAfterFromServer
+            ? i18n.t('List Rate Limited Wait', { n: Math.ceil(error.retryAfterMs / 1000) })
+            : i18n.t('List Rate Limited')
+    }
+    if (error instanceof Error && error.message) return error.message
+    return i18n.t('List Load Failed')
+}
+
+// ---------------------------------------------------------------------------
+// ProjectSelect component
+// ---------------------------------------------------------------------------
+
+interface ProjectSelectProps {
+    projects: ApiProjectInfo[]
+    selected: string | null
+    setSelected: (projectId: string | null) => void
+    disabled: boolean
+    loading: boolean
+}
+
+const ProjectSelect: FC<ProjectSelectProps> = ({ projects, selected, setSelected, disabled, loading }) => {
+    const { t } = useTranslation()
+
+    return (
+        <div className="ce-project-select">
+            {t('Select Project')}
+            <div className="ce-hstack">
+                {loading && <IconLoading className="ce-icon-sm" />}
+                <select
+                    disabled={disabled}
+                    className="ce-select"
+                    value={selected ?? ''}
+                    onChange={(e) => {
+                        const val = e.currentTarget.value
+                        setSelected(val || null)
+                    }}
+                >
+                    <option value="">{t('All conversations')}</option>
+                    {projects.map(project => (
+                        <option key={project.id} value={project.id}>{project.display.name}</option>
+                    ))}
+                </select>
+            </div>
+        </div>
+    )
+}
+
+// ---------------------------------------------------------------------------
+// ConversationSelect component
+// ---------------------------------------------------------------------------
+
+interface ConversationSelectProps {
+    conversations: ApiConversationItem[]
+    selected: ApiConversationItem[]
+    setSelected: (selected: ApiConversationItem[]) => void
+    disabled: boolean
+    loading: boolean
+    error: string
+}
+
+const ConversationSelect: FC<ConversationSelectProps> = ({
+    conversations,
+    selected,
+    setSelected,
+    disabled,
+    loading,
+    error,
+}) => {
+    const { t } = useTranslation()
+    const [query, setQuery] = useState('')
+    const lastClickedIndex = useRef<number>(-1)
+    const [sortField, setSortField] = useState<'title' | 'create_time' | 'update_time'>('create_time')
+    const [sortDir, setSortDir] = useState<'desc' | 'asc'>('desc')
+
+    // ── Filtering ──
+
+    const filtered = useMemo(() => {
+        let result = conversations
+        const q = query.trim()
+        if (q) result = result.filter(c => textSearch(c.title, q))
+        const dir = sortDir === 'asc' ? 1 : -1
+        return [...result].sort((a, b) => {
+            if (sortField === 'title') {
+                return dir * (a.title ?? '').localeCompare(b.title ?? '')
+            }
+            const aMs = toMs(sortField === 'update_time' ? a.update_time : a.create_time)
+            const bMs = toMs(sortField === 'update_time' ? b.update_time : b.create_time)
+            return dir * (aMs - bMs)
+        })
+    }, [conversations, query, sortField, sortDir])
+
+    const allFilteredSelected = filtered.length > 0 && filtered.every(c => selected.some(x => x.id === c.id))
+
+    const selectByExportStatus = useCallback((status: 'all' | 'not_exported' | 'updated') => {
+        lastClickedIndex.current = -1
+        const exportedMap = getExportedUpdateTimes()
+        if (status === 'all') {
+            setSelected(filtered)
+        }
+        else if (status === 'not_exported') {
+            setSelected(filtered.filter(c => !(c.id in exportedMap)))
+        }
+        else {
+            setSelected(filtered.filter(c => c.id in exportedMap && exportedMap[c.id] < toMs(c.update_time)))
+        }
+    }, [filtered, setSelected])
+
+    return (
+        <>
+            {/* ── Search input ── */}
+            <input
+                type="search"
+                className="ce-select-search"
+                placeholder={t('Search')}
+                value={query}
+                disabled={disabled}
+                onInput={(e) => {
+                    const val = (e.currentTarget as HTMLInputElement).value
+                    lastClickedIndex.current = -1
+                    setQuery(val)
+                }}
+            />
+
+            {/* ── Toolbar: select-all + status select + hint + counter ── */}
+            <div className="ce-select-toolbar">
+                <CheckBox
+                    label={t('Select All')}
+                    disabled={disabled}
+                    checked={allFilteredSelected}
+                    onCheckedChange={(checked) => {
+                        lastClickedIndex.current = -1
+                        setSelected(checked ? filtered : [])
+                    }}
+                />
+                {/* min-width: 0 lets the shrinkable items (hint first, then the
+                    loading indicator) truncate instead of the whole row wrapping */}
+                <div className="ce-select-toolbar-end">
+                    {loading && conversations.length > 0 && (
+                        <span className="ce-toolbar-loading">
+                            <IconLoading className="ce-icon-sm" />
+                            {t('Loading')}... ({conversations.length})
+                        </span>
+                    )}
+                    <select
+                        // Fixed width: only the placeholder is ever shown collapsed, and
+                        // without it the control sizes itself to the longest option,
+                        // which overflows the toolbar in verbose locales. The 2rem right
+                        // padding keeps the placeholder off the dropdown chevron.
+                        className="ce-select ce-toolbar-status"
+                        disabled={disabled || filtered.length === 0}
+                        value=""
+                        title="Select conversations by export status"
+                        onChange={(e) => {
+                            const val = e.currentTarget.value
+                            if (val) selectByExportStatus(val as 'all' | 'not_exported' | 'updated')
+                        }}
+                    >
+                        <option value="" disabled>{t('Select...')}</option>
+                        <option value="all">{t('Select All')}</option>
+                        <option value="not_exported">{t('Select Not Exported')}</option>
+                        <option value="updated">{t('Select Updated')}</option>
+                    </select>
+                    <span className="ce-toolbar-hint">
+                        {t('Shift Select Hint')}
+                    </span>
+                    <span className="ce-toolbar-count">
+                        {selected.length} / {filtered.length}
+                    </span>
+                </div>
+            </div>
+
+            {/* ── Column headers with sort controls ── */}
+            <div className="ce-list-header">
+                <button
+                    className={`ce-list-header-cell ce-list-header-cell-title${sortField === 'title' ? ' ce-list-header-cell-active' : ''}`}
+                    onClick={() => {
+                        if (sortField === 'title') {
+                            setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+                        }
+                        else {
+                            setSortField('title')
+                            setSortDir('asc')
+                        }
+                    }}
+                >
+                    Title {sortField === 'title' ? (sortDir === 'asc' ? '↑' : '↓') : '↕'}
+                </button>
+                <button
+                    className={`ce-list-header-cell${sortField === 'create_time' ? ' ce-list-header-cell-active' : ''}`}
+                    onClick={() => {
+                        if (sortField === 'create_time') {
+                            setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+                        }
+                        else {
+                            setSortField('create_time')
+                            setSortDir('desc')
+                        }
+                    }}
+                >
+                    Created {sortField === 'create_time' ? (sortDir === 'asc' ? '↑' : '↓') : '↕'}
+                </button>
+                <button
+                    className={`ce-list-header-cell${sortField === 'update_time' ? ' ce-list-header-cell-active' : ''}`}
+                    onClick={() => {
+                        if (sortField === 'update_time') {
+                            setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+                        }
+                        else {
+                            setSortField('update_time')
+                            setSortDir('desc')
+                        }
+                    }}
+                >
+                    Updated {sortField === 'update_time' ? (sortDir === 'asc' ? '↑' : '↓') : '↕'}
+                </button>
+            </div>
+
+            {/* ── Conversation list ── */}
+            <ul className="ce-select-list">
+                {loading && conversations.length === 0 && <li className="ce-select-item">{t('Loading')}...</li>}
+                {error && <li className="ce-select-item">{t('Error')}: {error}</li>}
+                {filtered.map((c, index) => {
+                    const isSelected = selected.some(x => x.id === c.id)
+                    return (
+                        <li
+                            className="ce-select-item"
+                            key={c.id}
+                            onClickCapture={(e: MouseEvent) => {
+                                if (disabled) return
+                                if (e.shiftKey && lastClickedIndex.current !== -1) {
+                                    e.preventDefault()
+                                    const start = Math.min(lastClickedIndex.current, index)
+                                    const end = Math.max(lastClickedIndex.current, index)
+                                    const rangeItems = filtered.slice(start, end + 1)
+                                    const newSelected = [...selected]
+                                    for (const item of rangeItems) {
+                                        if (!newSelected.some(x => x.id === item.id)) newSelected.push(item)
+                                    }
+                                    setSelected(newSelected)
+                                    return
+                                }
+                                lastClickedIndex.current = index
+                            }}
+                        >
+                            <CheckBox
+                                label={c.title}
+                                disabled={disabled}
+                                checked={isSelected}
+                                onCheckedChange={(checked) => {
+                                    setSelected(checked ? [...selected, c] : selected.filter(x => x.id !== c.id))
+                                }}
+                            />
+                            {c.is_starred && <span className="ce-starred" title="Starred">★</span>}
+                            <span
+                                className={`ce-select-item-meta${sortField === 'create_time' ? ' ce-select-item-meta-active' : ''}`}
+                                title={`Created: ${c.create_time ?? '—'}`}
+                            >
+                                {formatConvDate(c.create_time)}
+                            </span>
+                            <span
+                                className={`ce-select-item-meta${sortField === 'update_time' ? ' ce-select-item-meta-active' : ''}`}
+                                title={`Updated: ${c.update_time ?? '—'}`}
+                            >
+                                {formatConvDate(c.update_time)}
+                            </span>
+                        </li>
+                    )
+                })}
+                {!loading && !error && filtered.length === 0 && conversations.length > 0 && (
+                    <li className="ce-select-item ce-select-item-empty">{t('No results')}</li>
+                )}
+            </ul>
+        </>
+    )
+}
+
+// ---------------------------------------------------------------------------
+// DialogContent component
+// ---------------------------------------------------------------------------
+
+type ExportSource = 'API' | 'Local'
+
+interface DialogContentProps {
+    format: string
+    onClose: () => void
+}
+
+const DialogContent: FC<DialogContentProps> = ({ format, onClose }) => {
+    const { t } = useTranslation()
+    const { enableMeta, exportMetaList, exportAllLimit, imageMode } = useSettingContext()
+    const metaList = useMemo(() => enableMeta ? exportMetaList : [], [enableMeta, exportMetaList])
+
+    const exportAllOptions = useMemo(() => [
+        { label: 'Markdown', callback: exportAllToMarkdown },
+        { label: 'HTML', callback: exportAllToHtml },
+        { label: 'JSON', callback: exportAllToOfficialJson },
+        { label: 'JSON (ZIP)', callback: exportAllToJson },
+        { label: 'TavernAI JSONL (ZIP)', callback: exportAllToTavern },
+    ], [])
+
+    const fileInputRef = useRef<HTMLInputElement>(null)
+    const [exportSource, setExportSource] = useState<ExportSource>('API')
+    const [apiConversations, setApiConversations] = useState<ApiConversationItem[]>([])
+    const [localConversations, setLocalConversations] = useState<ApiConversationWithId[]>([])
+    const conversations = exportSource === 'API' ? apiConversations : localConversations
+
+    const [projects, setProjects] = useState<ApiProjectInfo[]>([])
+    const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null)
+    const [projectsLoading, setProjectsLoading] = useState(false)
+    const selectedProject = projects.find(p => p.id === selectedProjectId) ?? null
+
+    const [loading, setLoading] = useState(false)
+    const [error, setError] = useState('')
+    const [processing, setProcessing] = useState(false)
+
+    const [selected, setSelected] = useState<ApiConversationItem[]>([])
+    const [exportType, setExportType] = useState(exportAllOptions[0].label)
+    // A list error leaves the loaded part exportable.
+    const disabled = processing || selected.length === 0
+
+    // "Load more" state
+    const [hasMore, setHasMore] = useState(false)
+    const [loadingMore, setLoadingMore] = useState(false)
+    const [totalAvailable, setTotalAvailable] = useState<number | null>(null)
+    const nextPageRef = useRef<ConversationPagePosition>({ offset: 0 })
+
+    const requestQueue = useMemo(() => new RequestQueue<ApiConversationWithId>(200, 1600), [])
+    const archiveQueue = useMemo(() => new RequestQueue<boolean>(200, 1600), [])
+    const deleteQueue = useMemo(() => new RequestQueue<boolean>(200, 1600), [])
+
+    const [progress, setProgress] = useState({
+        total: 0,
+        completed: 0,
+        currentName: '',
+        currentStatus: '' as '' | 'processing' | 'retrying' | 'rate_limited',
+        rateLimitWaitSecs: undefined as number | undefined,
+        batchIndex: 0,
+        totalBatches: 0,
+    })
+
+    const pendingBatchesRef = useRef<ApiConversationItem[][]>([])
+    const batchIndexRef = useRef(0)
+    const totalBatchesRef = useRef(0)
+    /** Set to true when the user clicks Cancel — prevents the 'done' handler from starting the next batch */
+    const cancelledRef = useRef(false)
+    /** Conversations the queue gave up on, accumulated across every batch of the current export */
+    const skippedRef = useRef<string[]>([])
+    /** Incremented on each new fetch; callbacks check this to discard stale results after remount */
+    const fetchGenRef = useRef(0)
+
+    const onUpload = useCallback((e: ChangeEvent<HTMLInputElement>) => {
+        const file = (e.target as HTMLInputElement)?.files?.[0]
+        if (!file) return
+        const fileReader = new FileReader()
+        fileReader.onload = () => {
+            const data = JSON.parse(fileReader.result as string)
+            if (!Array.isArray(data)) {
+                alert(t('Invalid File Format'))
+                return
+            }
+            setSelected([])
+            setExportSource('Local')
+            setLocalConversations(data)
+        }
+        fileReader.readAsText(file)
+    }, [t])
+
+    const startApiBatch = useCallback((chunk: ApiConversationItem[]) => {
+        requestQueue.clear()
+        chunk.forEach(({ id, title, update_time }) => {
+            const entry = conversationCache.get(id)
+            const cached = entry && entry.updateTime === update_time ? entry.conversation : undefined
+            requestQueue.add({
+                name: title,
+                cached: !!cached,
+                request: async () => {
+                    let conversation = cached
+                    if (!conversation) {
+                        conversation = await fetchConversation(id)
+                        conversationCache.set(id, { updateTime: update_time, conversation })
+                    }
+                    const leaveOutImages = imageMode === 'omit' && (exportType === 'Markdown' || exportType === 'JSON (ZIP)')
+                    const skipImages = exportType === 'JSON' || exportType === 'TavernAI JSONL (ZIP)' || leaveOutImages
+                    return skipImages ? conversation : withImageAssets(conversation)
+                },
+            })
+        })
+        requestQueue.start()
+    }, [requestQueue, exportType, imageMode])
+
+    useEffect(() => {
+        const off = requestQueue.on('progress', (prog) => {
+            setProcessing(true)
+            setProgress({
+                ...prog,
+                rateLimitWaitSecs: prog.rateLimitWaitSecs,
+                batchIndex: batchIndexRef.current,
+                totalBatches: totalBatchesRef.current,
+                completed: batchIndexRef.current * EXPORT_OPERATION_BATCH + prog.completed,
+                // Every batch except the last is full, so sum the real sizes
+                // instead of assuming totalBatches * 100
+                total: pendingBatchesRef.current.reduce((n, batch) => n + batch.length, 0),
+            })
+        })
+        return () => off()
+    }, [requestQueue])
+
+    useEffect(() => {
+        const off = archiveQueue.on('progress', (prog) => {
+            setProcessing(true)
+            setProgress({ ...prog, rateLimitWaitSecs: prog.rateLimitWaitSecs, batchIndex: 0, totalBatches: 0 })
+        })
+        return () => off()
+    }, [archiveQueue])
+
+    useEffect(() => {
+        const off = deleteQueue.on('progress', (prog) => {
+            setProcessing(true)
+            setProgress({ ...prog, rateLimitWaitSecs: prog.rateLimitWaitSecs, batchIndex: 0, totalBatches: 0 })
+        })
+        return () => off()
+    }, [deleteQueue])
+
+    useEffect(() => {
+        const off = requestQueue.on('done', async (results) => {
+            // If the user cancelled, just stop — don't download or start the next batch
+            if (cancelledRef.current) {
+                cancelledRef.current = false
+                setProcessing(false)
+                exportingRef.current = false
+                return
+            }
+            const batchIdx = batchIndexRef.current
+            const totalBatches = totalBatchesRef.current
+            const partIndex = batchIdx + 1
+            const callback = exportAllOptions.find(o => o.label === exportType)?.callback
+            if (callback && results.length > 0) {
+                await callback(format, results, metaList, selectedProject?.display.name, partIndex, totalBatches)
+                // Only conversations that were actually exported successfully get recorded
+                markExported(results)
+            }
+            skippedRef.current.push(...requestQueue.getSkipped())
+            if (partIndex < totalBatches) {
+                await sleep(400)
+                batchIndexRef.current++
+                const nextChunk = pendingBatchesRef.current[batchIndexRef.current]
+                if (nextChunk) startApiBatch(nextChunk)
+            }
+            else {
+                setProcessing(false)
+                const skipped = skippedRef.current
+                if (skipped.length > 0) {
+                    const shown = skipped.slice(0, MAX_SKIPPED_SHOWN).map(name => `- ${name}`)
+                    if (skipped.length > MAX_SKIPPED_SHOWN) shown.push('- …')
+                    alert(`${t('Export Skipped Message', { n: skipped.length })}\n\n${shown.join('\n')}`)
+                }
+            }
+        })
+        return () => off()
+    }, [requestQueue, exportAllOptions, exportType, format, metaList, startApiBatch, selectedProject, t])
+
+    useEffect(() => {
+        const off = archiveQueue.on('done', () => {
+            setProcessing(false)
+            setApiConversations(prev => prev.filter(c => !selected.some(s => s.id === c.id)))
+            setSelected([])
+            alert(t('Conversation Archived Message'))
+        })
+        return () => off()
+    }, [archiveQueue, selected, t])
+
+    useEffect(() => {
+        const off = deleteQueue.on('done', () => {
+            setProcessing(false)
+            setApiConversations(prev => prev.filter(c => !selected.some(s => s.id === c.id)))
+            setSelected([])
+            alert(t('Conversation Deleted Message'))
+        })
+        return () => off()
+    }, [deleteQueue, selected, t])
+
+    const cancelExport = useCallback(() => {
+        cancelledRef.current = true
+        requestQueue.stop()
+        archiveQueue.stop()
+        deleteQueue.stop()
+    }, [requestQueue, archiveQueue, deleteQueue])
+
+    const exportAllFromApi = useCallback(() => {
+        if (disabled) return
+        cancelledRef.current = false
+        skippedRef.current = []
+        const chunks = chunkArray(selected, EXPORT_OPERATION_BATCH)
+        pendingBatchesRef.current = chunks
+        batchIndexRef.current = 0
+        totalBatchesRef.current = chunks.length
+        setProcessing(true)
+        setProgress({
+            total: selected.length,
+            completed: 0,
+            currentName: '',
+            currentStatus: 'processing',
+            rateLimitWaitSecs: undefined,
+            batchIndex: 0,
+            totalBatches: chunks.length,
+        })
+        startApiBatch(chunks[0])
+    }, [disabled, selected, startApiBatch])
+
+    const exportAllFromLocal = useCallback(async () => {
+        if (disabled) return
+        const results = localConversations.filter(c => selected.some(s => s.id === c.id))
+        const callback = exportAllOptions.find(o => o.label === exportType)?.callback
+        if (!callback) return
+        const chunks = chunkArray(results, EXPORT_OPERATION_BATCH)
+        setProcessing(true)
+        for (let i = 0; i < chunks.length; i++) {
+            await callback(format, chunks[i], metaList, selectedProject?.display.name, i + 1, chunks.length)
+            markExported(chunks[i])
+            if (i < chunks.length - 1) await sleep(400)
+        }
+        setProcessing(false)
+    }, [disabled, selected, localConversations, exportAllOptions, exportType, format, metaList, selectedProject])
+
+    const exportAll = useMemo(() => {
+        return exportSource === 'API' ? exportAllFromApi : exportAllFromLocal
+    }, [exportSource, exportAllFromApi, exportAllFromLocal])
+
+    const deleteAll = useCallback(() => {
+        if (disabled) return
+        if (!confirm(t('Conversation Delete Alert'))) return
+        deleteQueue.clear()
+        selected.forEach(({ id, title }) => {
+            deleteQueue.add({ name: title, request: () => deleteConversation(id) })
+        })
+        deleteQueue.start()
+    }, [disabled, selected, deleteQueue, t])
+
+    const archiveAll = useCallback(() => {
+        if (disabled) return
+        if (!confirm(t('Conversation Archive Alert'))) return
+        archiveQueue.clear()
+        selected.forEach(({ id, title }) => {
+            archiveQueue.add({ name: title, request: () => archiveConversation(id) })
+        })
+        archiveQueue.start()
+    }, [disabled, selected, archiveQueue, t])
+
+    // Cancel any in-flight work when the dialog unmounts to avoid stale-state errors
+    useEffect(() => {
+        const genRef = fetchGenRef
+        return () => {
+            exportingRef.current = false
+            genRef.current++
+            requestQueue.clear()
+            archiveQueue.clear()
+            deleteQueue.clear()
+        }
+    }, [requestQueue, archiveQueue, deleteQueue])
+
+    // Sync processing flag so ExportDialog can gate ESC / outside-click
+    useEffect(() => {
+        exportingRef.current = processing
+    }, [processing])
+
+    // Fetch projects on mount
+    useEffect(() => {
+        setProjectsLoading(true)
+        fetchProjects()
+            .then(setProjects)
+            .catch(err => console.error('Error fetching projects:', err))
+            .finally(() => setProjectsLoading(false))
+    }, [])
+
+    // Auto-load conversations on dialog open (or when project changes)
+    useEffect(() => {
+        const gen = ++fetchGenRef.current
+        const alive = () => gen === fetchGenRef.current
+        setSelected([])
+
+        setApiConversations([])
+        setHasMore(false)
+        setLoadingMore(false)
+        nextPageRef.current = { offset: 0 }
+        setTotalAvailable(null)
+        setError('')
+        setLoading(true)
+        fetchAllConversations(
+            selectedProjectId,
+            exportAllLimit,
+            (batch) => { if (alive()) setApiConversations(prev => [...prev, ...batch]) },
+            (hasMore) => {
+                if (alive()) setHasMore(hasMore)
+            },
+            // The promise still resolves with the partial list, so report the error here.
+            (error) => {
+                if (alive()) setError(describeListLoadError(error))
+            },
+            (position) => { if (alive()) nextPageRef.current = position },
+        )
+            .catch((err: Error) => {
+                if (!alive()) return
+                console.error('Error fetching conversations:', err)
+                setError(describeListLoadError(err))
+            })
+            .finally(() => { if (alive()) setLoading(false) })
+    }, [exportAllLimit, selectedProjectId])
+
+    const loadMore = useCallback(async () => {
+        if (loadingMore) return
+        const gen = fetchGenRef.current
+        const alive = () => gen === fetchGenRef.current
+        setLoadingMore(true)
+        try {
+            const position = nextPageRef.current
+            const page = await fetchConversationsPage(selectedProjectId, position.offset, EXPORT_OPERATION_BATCH, position.cursor)
+            if (!alive()) return
+            const knownIds = new Set(apiConversations.map(item => item.id))
+            const novel = page.items.filter((item) => {
+                if (knownIds.has(item.id)) return false
+                knownIds.add(item.id)
+                return true
+            })
+            if (page.has_more && (novel.length === 0 || (selectedProjectId && page.cursor === position.cursor))) {
+                throw new Error('ChatGPT pagination made no progress. Please retry loading.')
+            }
+            nextPageRef.current = { offset: page.next_offset!, cursor: page.cursor }
+            setApiConversations(prev => [...prev, ...novel])
+            setError('')
+            if (page.total !== null) setTotalAvailable(page.total)
+            setHasMore(page.has_more ?? false)
+        }
+        catch (err) {
+            if (!alive()) return
+            console.error('loadMore error', err)
+            setError(describeListLoadError(err))
+        }
+        finally {
+            if (alive()) setLoadingMore(false)
+        }
+    }, [loadingMore, apiConversations, selectedProjectId])
+
+    const totalBatches = Math.ceil(selected.length / EXPORT_OPERATION_BATCH) || 1
+
+    // ── API health probe ──────────────────────────────────────────────────────
+    type ProbeStatus = null | 'testing' | 'ok' | 'rate_limited' | 'error'
+    const [probeStatus, setProbeStatus] = useState<ProbeStatus>(null)
+    const [probeRetryAfterSecs, setProbeRetryAfterSecs] = useState<number | undefined>()
+    const [probeHeaders, setProbeHeaders] = useState<Record<string, string>>({})
+
+    const runProbe = useCallback(async () => {
+        setProbeStatus('testing')
+        try {
+            const result = await probeApi()
+            setProbeHeaders(result.rateLimitHeaders)
+            if (result.ok) {
+                setProbeStatus('ok')
+            }
+            else {
+                setProbeStatus('rate_limited')
+                setProbeRetryAfterSecs(result.retryAfterMs != null ? Math.round(result.retryAfterMs / 1000) : undefined)
+            }
+        }
+        catch {
+            setProbeStatus('error')
+        }
+    }, [])
+
+    const probeLabel = probeStatus === 'testing'
+        ? '⏳ Testing…'
+        : probeStatus === 'ok'
+            ? '✅ API ready'
+            : probeStatus === 'rate_limited'
+                ? `🚫 Rate limited${probeRetryAfterSecs != null ? ` · wait ${probeRetryAfterSecs}s` : ''}`
+                : probeStatus === 'error'
+                    ? '⚠️ Error'
+                    : null
+
+    return (
+        <>
+            <div className="ce-export-source">
+                {t('Export from official export file')} (conversations.json)&nbsp;
+                <div className="ce-hstack">
+                    {exportSource === 'API' && (
+                        <button
+                            className="ce-button ce-button-neutral"
+                            style={{ fontSize: '0.72rem', padding: '2px 8px', whiteSpace: 'nowrap' }}
+                            disabled={probeStatus === 'testing' || processing}
+                            title={Object.keys(probeHeaders).length > 0
+                                ? `Rate-limit headers: ${JSON.stringify(probeHeaders)}`
+                                : 'Check if the API is currently rate-limiting requests'}
+                            onClick={runProbe}
+                        >
+                            {probeLabel ?? 'Test API'}
+                        </button>
+                    )}
+                    {exportSource === 'API' && (
+                        <button className="ce-icon-button" aria-label="Upload" onClick={() => fileInputRef.current?.click()}>
+                            <IconUpload className="ce-icon" />
+                        </button>
+                    )}
+                </div>
+            </div>
+            <input
+                type="file"
+                accept="application/json"
+                hidden
+                ref={fileInputRef}
+                onChange={onUpload}
+            />
+            {exportSource === 'API' && (
+                <ProjectSelect
+                    projects={projects}
+                    selected={selectedProjectId}
+                    setSelected={setSelectedProjectId}
+                    disabled={processing}
+                    loading={projectsLoading}
+                />
+            )}
+            <ConversationSelect
+                conversations={conversations}
+                selected={selected}
+                setSelected={setSelected}
+                disabled={processing}
+                loading={loading}
+                error={error}
+            />
+
+            {/* Load-more button */}
+            {exportSource === 'API' && !loading && !processing && hasMore && (
+                <div className="ce-load-more">
+                    <button
+                        className="ce-button ce-button-neutral"
+                        style={{ fontSize: '0.8rem', padding: '4px 14px' }}
+                        disabled={loadingMore}
+                        onClick={loadMore}
+                    >
+                        {loadingMore
+                            ? `${t('Loading')}...`
+                            : totalAvailable !== null
+                                ? t('Load more conversations remaining', { n: EXPORT_OPERATION_BATCH, remaining: totalAvailable - apiConversations.length })
+                                : t('Load more conversations', { n: EXPORT_OPERATION_BATCH })}
+                    </button>
+                    {totalAvailable !== null && !loadingMore && (
+                        <span className="ce-muted-count">
+                            {apiConversations.length} / {totalAvailable}
+                        </span>
+                    )}
+                </div>
+            )}
+
+            <div className="ce-action-bar">
+                <select
+                    className="ce-select"
+                    disabled={processing}
+                    value={exportType}
+                    onChange={e => setExportType(e.currentTarget.value)}
+                >
+                    {exportAllOptions.map(({ label }) => (
+                        <option key={t(label)} value={label}>{label}</option>
+                    ))}
+                </select>
+                <div className="ce-action-buttons">
+                    <button className="ce-button ce-button-red" disabled={disabled || exportSource === 'Local'} onClick={archiveAll}>
+                        {t('Archive')}
+                    </button>
+                    <button className="ce-button ce-button-red" disabled={disabled || exportSource === 'Local'} onClick={deleteAll}>
+                        {t('Delete')}
+                    </button>
+                    <button className="ce-button ce-button-green" disabled={disabled} onClick={exportAll}>
+                        {t('Export')}
+                    </button>
+                </div>
+            </div>
+            {totalBatches > 1 && !processing && (
+                <p className="ce-batch-note">
+                    {`${totalBatches} downloads \u00B7 100 conversations each`}
+                </p>
+            )}
+            {processing && (
+                <>
+                    <div className="ce-progress-header">
+                        <span className="ce-progress-name">
+                            {progress.currentStatus === 'rate_limited'
+                                ? `⏳ Rate limited — waiting ${progress.rateLimitWaitSecs ?? '…'}s`
+                                : progress.currentName}
+                        </span>
+                        <span className="ce-progress-count">
+                            {progress.totalBatches > 1
+                                ? `${t('Batch progress').replace('{{current}}', String(progress.batchIndex + 1)).replace('{{total}}', String(progress.totalBatches))} \u00B7 ${progress.completed}/${progress.total}`
+                                : `${progress.completed}/${progress.total}`}
+                        </span>
+                        <button
+                            className="ce-button ce-button-red"
+                            style={{ fontSize: '0.75rem', padding: '3px 10px', height: 'auto' }}
+                            title="Stop the export — any batches already downloaded are kept"
+                            onClick={cancelExport}
+                        >
+                            {t('Cancel')}
+                        </button>
+                    </div>
+                    <div className="ce-progress">
+                        <div
+                            className={`ce-progress-bar${progress.currentStatus === 'rate_limited' ? ' ce-progress-bar-waiting' : ''}`}
+                            style={{ width: `${progress.total > 0 ? (progress.completed / progress.total) * 100 : 0}%` }}
+                        />
+                    </div>
+                </>
+            )}
+            {processing
+                ? (
+                        <button
+                            className="ce-icon-button ce-close-button"
+                            aria-label="Export in progress"
+                            title="Click Cancel to stop the export"
+                            style={{ cursor: 'not-allowed', opacity: 0.25 }}
+                        >
+                            <IconCross />
+                        </button>
+                    )
+                : (
+                        <button className="ce-icon-button ce-close-button" aria-label="Close" onClick={onClose}>
+                            <IconCross />
+                        </button>
+                    )}
+        </>
+    )
+}
+
+// ---------------------------------------------------------------------------
+// ExportDialog (root)
+// ---------------------------------------------------------------------------
+
+interface ExportDialogProps {
+    format: string
+    open: boolean
+    onOpenChange: (value: boolean) => void
+}
+
+export function ExportDialog({ format, open, onOpenChange }: ExportDialogProps) {
+    const { t } = useTranslation()
+    const onChange = (value: boolean) => {
+        if (!value && exportingRef.current) return // block close while exporting
+        onOpenChange(value)
+    }
+
+    return (
+        <Dialog
+            open={open}
+            onOpenChange={onChange}
+            title={t('Export Dialog Title')}
+            className="ce-dialog-plain"
+        >
+            <DialogContent format={format} onClose={() => onChange(false)} />
+        </Dialog>
+    )
+}

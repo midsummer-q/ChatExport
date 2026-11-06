@@ -1,0 +1,1310 @@
+import urlcatImport from 'urlcat'
+import { apiUrl, baseUrl } from './constants'
+import { getChatIdFromUrl, getConversationFromSharePage, isSharePage, isTemporaryChat } from './page'
+import { loadShareConversation } from './share'
+import { getTemporaryChatId } from './temporaryChat'
+import { blobToDataURL } from './utils/dom'
+import { getCachedImage, setCachedImage } from './utils/imageCache'
+import { getModelName } from './utils/model'
+
+// urlcat ships CommonJS with `exports.default`. Because this package is
+// `"type": "module"`, vite 8 (rolldown) applies Node's interop and hands the
+// default import the whole `module.exports` object, so unwrap either shape.
+const urlcat: typeof urlcatImport = typeof urlcatImport === 'function'
+    ? urlcatImport
+    : (urlcatImport as unknown as { default: typeof urlcatImport }).default
+
+interface ApiSession {
+    accessToken: string
+    authProvider: string
+    expires: string
+    user: {
+        email: string
+        groups: string[]
+        // token's issued_at timestamp
+        iat: number
+        id: string
+        // token's expiration timestamp
+        idp: string
+        image: string
+        intercom_hash: string
+        // whether the user has multi-factor authentication enabled
+        mfa: boolean
+        name: string
+        picture: string
+    }
+}
+
+export interface Citation {
+    start_ix: number
+    end_ix: number
+    citation_format_type: 'tether_og' & (string & {})
+    metadata?: {
+        extra?: {
+            cited_message_idx: number
+            evidence_text: string
+        }
+        text: string
+        title: string
+        type: 'webpage' & (string & {})
+        url: string
+    }
+}
+
+export interface ContentReferenceSource {
+    title?: string
+    url?: string
+    attribution?: string
+    supporting_websites?: ContentReferenceSource[]
+}
+
+export interface ImageSearchResult {
+    title?: string
+    /** Page the image comes from */
+    url?: string
+    content_url?: string
+}
+
+export interface ContentReference {
+    type: 'grouped_webpages' | 'sources_footnote' | 'nav_list' | 'alt_text' | 'webpage' | (string & {})
+    /** The text that was matched in the content, e.g., "citeturn0search3" */
+    matched_text?: string
+    start_idx: number
+    end_idx: number
+    /** Pre-formatted markdown link, e.g., "([Title](url))" */
+    alt?: string
+    /** Array of actual reference items with URL and title */
+    items?: ContentReferenceSource[]
+    /** Sources shown in ChatGPT's end-of-answer source list */
+    sources?: ContentReferenceSource[]
+    fallback_items?: ContentReferenceSource[]
+    safe_urls?: string[]
+    refs?: string[]
+    /** File name of an uploaded file, on `file` references */
+    name?: string
+    /** Image search results, wrapped in `image_result` on `image_group` references */
+    images?: Array<ImageSearchResult & { image_result?: ImageSearchResult }>
+    /** What a `client_defined_widget` reference draws in place of `matched_text` */
+    data?: {
+        widget_type?: 'code_block' | 'charts_widget_v2' | (string & {})
+        content?: unknown
+    }
+    // Legacy fields (may still be present in some responses)
+    url?: string
+    title?: string
+    attribution?: string
+}
+
+interface CiteMetadata {
+    citation_format: {
+        name: 'tether_og' & (string & {})
+    }
+    metadata_list: Array<{
+        title: string
+        url: string
+        text: string
+    }>
+}
+
+interface MessageAttachment {
+    id: string
+    name: string
+    mime_type?: string
+    size?: number
+}
+
+interface MessageMeta {
+    aggregate_result?: {
+        code: string
+        final_expression_output?: string
+        end_time: number
+        jupyter_messages: unknown[]
+        messages: Array<{
+            image_url: string
+            message_type: 'image'
+            sender: 'server'
+            time: number
+            width: number
+            height: number
+        }>
+        run_id: string
+        start_time: number
+        status: 'success' | 'error' & (string & {})
+        update_time: number
+    }
+    args?: unknown
+    command?: 'click' | 'search' | 'quote' | 'quote_lines' | 'scroll' & (string & {})
+    finish_details?: {
+        // stop: string
+        stop_tokens?: number[]
+        type: 'stop' | 'interrupted' & (string & {})
+    }
+    is_complete?: boolean
+    model_slug?: string
+    parent_id?: string
+    timestamp_?: 'absolute' & (string & {})
+    citations?: Citation[]
+    _cite_metadata?: CiteMetadata
+    /** New-style content references for web search citations */
+    content_references?: ContentReference[]
+    /** Files the user uploaded with this message */
+    attachments?: MessageAttachment[]
+    /** Whether this message is hidden in the UI (e.g., internal system prompts) */
+    is_visually_hidden_from_conversation?: boolean
+    /** Whether this assistant message is a transient thinking preamble hidden from the final conversation */
+    is_thinking_preamble_message?: boolean
+    /** Duration of reasoning in seconds (from reasoning_recap messages) */
+    finished_duration_sec?: number
+    /** Reasoning activity title shown in the thinking panel */
+    reasoning_title?: string
+    /** Interactive replies, whose `parts` hold widget markup only ChatGPT can render */
+    model_dil_v2?: {
+        /** ChatGPT's own Markdown version of the reply */
+        fallbackMarkdown?: string
+    }
+}
+
+export type AuthorRole = 'system' | 'assistant' | 'user' | 'tool'
+
+interface MultiModalInputImage {
+    /**
+     * hack: this come from the api in the form of `sediment://file-base64`, but we replace it
+     * automatically in the api wrapper with a data uri
+     */
+    asset_pointer: string
+    content_type: 'image_asset_pointer' & (string & {})
+    fovea: number
+    height: number
+    size_bytes: number
+    width: number
+    metadata?: {
+        dalle?: {
+            gen_id: string
+            prompt: string
+            seed: number
+            serialization_title: string
+        }
+    }
+}
+
+interface MultiModalInputAudio {
+    content_type: 'audio_asset_pointer'
+    audio_asset_pointer: string
+    expiry_datetime: string
+    format: string
+    metadata: {
+        start_timestamp: number
+        end_timestamp: number
+        pretokenized_vq: null
+    }
+    size_bytes: number
+}
+
+interface MultiModalAudioVideoAssetPointer {
+    content_type: 'real_time_user_audio_video_asset_pointer'
+    expiry_datetime: string
+    frames_asset_pointers: unknown[]
+    video_container_asset_pointer: null
+    audio_asset_pointer: {
+        expiry_datetime: string
+        content_type: 'audio_asset_pointer'
+        asset_pointer: string
+        size_bytes: number
+        format: string
+        metadata: {
+            start_timestamp: null
+            end_timestamp: null
+            pretokenized_vq: null
+            interruptions: null
+            original_audio_source: null
+            transcription: null
+            word_transcription: null
+            start: number
+            end: number
+        }
+    }
+    audio_start_timestamp: number
+}
+
+interface MultiModalAudioTranscription {
+    content_type: 'audio_transcription'
+    decoding_id: null
+    direction: 'in' | 'out'
+    text: string
+}
+
+export interface ConversationNodeMessage {
+    author: {
+        role: AuthorRole
+        name?: 'browser' | 'python' | 'file_search' & (string & {})
+        metadata: unknown
+    }
+    content: {
+        // chat response
+        content_type: 'text'
+        parts: string[]
+    } | {
+        // plugin response
+        content_type: 'code'
+        language: 'unknown' & (string & {})
+        text: string
+    } | {
+        content_type: 'execution_output'
+        text: string
+    } | {
+        content_type: 'user_editable_context'
+        user_profile: string
+        user_instructions: string
+    } | {
+        content_type: 'tether_quote'
+        domain?: string
+        text: string
+        title: string
+        url?: string
+    } | {
+        content_type: 'tether_browsing_code'
+        // unknown
+    } | {
+        content_type: 'tether_browsing_display'
+        result: string
+        summary?: string
+    } | {
+        // multi-modal input
+        content_type: 'multimodal_text'
+        parts: Array<MultiModalAudioVideoAssetPointer | MultiModalAudioTranscription | MultiModalInputImage | MultiModalInputAudio | string>
+    } | {
+        content_type: 'model_editable_context'
+        model_set_context: string
+    } | {
+        // Thinking/reasoning content from thinking models (hidden in UI)
+        content_type: 'thoughts'
+        thoughts: Array<{
+            summary: string
+            content: string
+            chunks: string[]
+            finished: boolean
+        }>
+    } | {
+        // Reasoning recap showing "Thought for Xs" (hidden in UI)
+        content_type: 'reasoning_recap'
+        content: string
+    }
+    create_time?: number
+    update_time?: number
+    // end_turn: boolean
+    id: string
+    metadata?: MessageMeta
+    recipient: 'all' | 'browser' | 'python' | 'dalle.text2im' & (string & {})
+    channel?: string | null
+    status: string
+    end_turn?: boolean
+    weight: number
+}
+
+export interface ThinkingContent {
+    thoughts: Array<{ summary: string, content: string }>
+    activities?: string[]
+    durationSeconds?: number
+}
+
+export interface ConversationNode {
+    children: string[]
+    id: string
+    message?: ConversationNodeMessage
+    parent?: string
+    thinking?: ThinkingContent
+}
+
+export interface ApiConversation {
+    create_time: number
+    conversation_id?: string
+    current_node: string
+    mapping: {
+        [key: string]: ConversationNode
+    }
+    moderation_results: unknown[]
+    title: string
+    is_archived: boolean
+    update_time: number
+    safe_urls?: string[]
+}
+
+export type ApiConversationWithId = ApiConversation & {
+    id: string
+}
+
+export interface ApiConversationItem {
+    id: string
+    title: string
+    /** ISO 8601 string from the list endpoint (e.g. "2025-07-10T14:53:58.103234Z") */
+    create_time: number | string
+    /** ISO 8601 string from the list endpoint */
+    update_time?: number | string
+    /** True when the user has starred/pinned this conversation */
+    is_starred?: boolean | null
+    /** True for temporary chats that are not saved to history */
+    is_temporary_chat?: boolean
+    /** Non-null when the conversation belongs to a custom GPT or project */
+    gizmo_id?: string | null
+    /** How the conversation was initiated, e.g. "apple" for Siri/iOS, null for web/app */
+    conversation_origin?: string | null
+    /** ISO 8601 timestamp if the conversation is pinned, null otherwise */
+    pinned_time?: string | null
+    /** True when this conversation is archived */
+    is_archived?: boolean
+    /** True when memory is disabled for this conversation */
+    is_do_not_remember?: boolean | null
+}
+
+export interface ApiConversations {
+    // what is this for?
+    has_missing_conversations: boolean
+    items: ApiConversationItem[]
+    limit: number
+    offset: number
+    total: number | null
+    cursor?: string | null
+    next_offset?: number
+    has_more?: boolean
+}
+
+export interface ConversationPagePosition {
+    offset: number
+    cursor?: string | null
+}
+
+/// "Gizmos" are what OpenAI calls "projects" or other GPTs in the UI
+export interface ApiGizmo {
+    // weird nesting but ok
+    gizmo: { gizmo: ApiProjectInfo }
+    conversations: { itmes: ApiConversationItem[] }
+}
+
+export interface ApiProjectInfo {
+    id: string
+    organization_id: string
+    display: { name: string, description: string }
+    // todo: support exporting project context
+}
+
+interface ApiAccountsCheckAccountDetail {
+    account_user_role: 'account-owner' | string
+    account_user_id: string | null
+    processor: Record<string, boolean>
+    account_id: string | null
+    organization_id?: string | null
+    is_most_recent_expired_subscription_gratis: boolean
+    has_previously_paid_subscription: boolean
+    name?: string | null
+    profile_picture_id?: string | null
+    profile_picture_url?: string | null
+    structure: 'workspace' | 'personal'
+    plan_type: 'team' | 'free'
+    is_deactivated: boolean
+    promo_data: Record<string, unknown>
+}
+
+interface ApiAccountsCheckEntitlement {
+    subscription_id?: string | null
+    has_active_subscription?: boolean
+    subscription_plan?: 'chatgptteamplan' | 'chatgptplusplan'
+    expires_at?: string | null
+    billing_period?: 'monthly' | string | null
+}
+
+interface ApiAccountsCheckAccount {
+    account: ApiAccountsCheckAccountDetail
+    features: string[]
+    entitlement: ApiAccountsCheckEntitlement
+    last_active_subscription?: Record<string, unknown> | null
+    is_eligible_for_yearly_plus_subscription: boolean
+}
+
+interface ApiAccountsCheck {
+    accounts: {
+        [key: string]: ApiAccountsCheckAccount
+    }
+    account_ordering: string[]
+}
+
+type ApiFileDownload = {
+    status: 'success'
+    /** signed download url */
+    download_url: string
+    metadata: {} | null
+    file_name: string | null
+    file_size_bytes: number | null
+    mimedata: string | null
+    mime_type: string | null
+    /** iso8601 datetime string */
+    creation_time: string | null
+} | {
+    status: 'error'
+    error_code: string
+    error_message: string | null
+}
+
+// eslint-disable-next-line no-restricted-syntax
+const enum ChatGPTCookie {
+    AgeVerification = 'oai-av-seen',
+    AllowNonessential = 'oai-allow-ne',
+    DeviceId = 'oai-did',
+    DomainMigrationSourceCompleted = 'oai-dm-src-c-240329',
+    DomainMigrationTargetCompleted = 'oai-dm-tgt-c-240329',
+    HasClickedOnTryItFirstLink = 'oai-tif-20240402',
+    HasLoggedInBefore = 'oai-hlib',
+    HideLoggedOutBanner = 'hide-logged-out-banner',
+    IntercomDeviceIdDev = 'intercom-device-id-izw1u7l7',
+    IntercomDeviceIdProd = 'intercom-device-id-dgkjq2bp',
+    IpOverride = 'oai-ip-country',
+    IsEmployee = '_oaiauth',
+    IsPaidUser = '_puid',
+    LastLocation = 'oai-ll',
+    SegmentUserId = 'ajs_user_id',
+    SegmentUserTraits = 'ajs_user_traits',
+    ShowPaymentModal = 'ui-show-payment-modal',
+    TempEnableUnauthedCompliance = 'temp-oai-compliance',
+    Workspace = '_account',
+}
+
+const sessionApi = urlcat(baseUrl, '/api/auth/session')
+let sessionPromise: Promise<ApiSession> | null = null
+let sessionCachedAt = 0
+const conversationApi = (id: string) => urlcat(apiUrl, '/conversation/:id', { id })
+const shareConversationApi = (id: string) => urlcat(apiUrl, '/share/:id', { id })
+const conversationsApi = (offset: number, limit: number) => urlcat(apiUrl, '/conversations', { offset, limit })
+const fileDownloadApi = (id: string) => urlcat(apiUrl, '/files/download/:id', { id, post_id: '', inline: false })
+const projectsApi = (cursor: number | null) => urlcat(apiUrl, '/gizmos/snorlax/sidebar', { conversations_per_gizmo: 0, cursor })
+const projectConversationsApi = (gizmo: string, cursor: string | number, limit: number) => urlcat(apiUrl, '/gizmos/:gizmo/conversations', { gizmo, cursor, limit })
+const accountsCheckApi = urlcat(apiUrl, '/accounts/check/v4-2023-04-27')
+
+export async function getCurrentChatId(): Promise<string> {
+    if (isSharePage()) {
+        const shareId = getChatIdFromUrl()
+        if (!shareId) throw new Error('No share id found.')
+        return `__share__${shareId}`
+    }
+
+    // A temporary chat is absent from the history list and never puts its id in
+    // the URL, so without this the lookup below would fall through to the most
+    // recent conversation and export the wrong chat. Guarded by
+    // `checkIfTemporaryChatIsExportable` at every export entry point.
+    if (isTemporaryChat()) {
+        const temporaryChatId = getTemporaryChatId()
+        if (!temporaryChatId) throw new Error('No temporary chat id found.')
+        return temporaryChatId
+    }
+
+    const chatId = getChatIdFromUrl()
+    if (chatId) return chatId
+
+    // Never silently export an unrelated, most-recent conversation.
+    throw new Error('Unable to identify this conversation. Open a saved ChatGPT conversation and try again.')
+}
+
+async function fetchImageFromPointer(uri: string) {
+    const cached = await getCachedImage(uri)
+    if (cached) return cached
+
+    const pointer = uri.replace('sediment://', '')
+    const imageDetails = await fetchApi<ApiFileDownload>(fileDownloadApi(pointer))
+    if (imageDetails.status === 'error') {
+        console.error('Failed to fetch image asset', imageDetails.error_code, imageDetails.error_message)
+        return null
+    }
+
+    const image = await fetch(imageDetails.download_url)
+    const blob = await image.blob()
+    const base64 = await blobToDataURL(blob)
+    const dataUrl = base64.replace(/^data:.*?;/, `data:${image.headers.get('content-type')};`)
+    await setCachedImage(uri, dataUrl)
+    return dataUrl
+}
+
+/**
+ * Returns a copy of the conversation with `sediment://` image pointers
+ * replaced by data uris. The input is left untouched so a raw conversation
+ * can be cached and reused for exports that want the original pointers.
+ */
+export async function withImageAssets<T extends ApiConversation>(conversation: T): Promise<T> {
+    const copy = structuredClone(conversation)
+    await replaceImageAssets(copy)
+    return copy
+}
+
+/**
+ * Image sources a conversation carries: uploaded and generated images in
+ * multimodal parts, and images from code execution output.
+ */
+interface ImageSource {
+    src: string
+    replace: (src: string) => void
+}
+
+function collectImageSources(conversation: ApiConversation): ImageSource[] {
+    const isImagePart = (part: any): part is MultiModalInputImage => {
+        return typeof part === 'object'
+            && part !== null
+            && part.content_type === 'image_asset_pointer'
+            && typeof part.asset_pointer === 'string'
+    }
+
+    return Object.values(conversation.mapping).flatMap((node): ImageSource[] => {
+        const message = node.message
+        if (!message) return []
+
+        if (message.content.content_type === 'multimodal_text') {
+            const parts = Array.isArray(message.content.parts) ? message.content.parts : []
+            return parts.filter(isImagePart).map(part => ({
+                src: part.asset_pointer,
+                replace: (src) => { part.asset_pointer = src },
+            }))
+        }
+
+        if (message.content.content_type === 'execution_output') {
+            const messages = message.metadata?.aggregate_result?.messages ?? []
+            return messages
+                .filter(msg => msg.message_type === 'image')
+                .map(msg => ({
+                    src: msg.image_url,
+                    replace: (src) => { msg.image_url = src },
+                }))
+        }
+
+        return []
+    })
+}
+
+const IMAGE_SOURCE_CONCURRENCY = 4
+
+/**
+ * Replaces every image source in place with what `resolve` returns for it.
+ * A source is kept when `resolve` returns null or throws.
+ */
+export async function replaceImageSources(
+    conversation: ApiConversation,
+    resolve: (src: string) => Promise<string | null>,
+): Promise<void> {
+    const imagesBySrc = new Map<string, ImageSource[]>()
+    for (const image of collectImageSources(conversation)) {
+        const images = imagesBySrc.get(image.src)
+        if (images) images.push(image)
+        else imagesBySrc.set(image.src, [image])
+    }
+
+    const queue = Array.from(imagesBySrc.entries())
+    let nextIndex = 0
+
+    const worker = async () => {
+        while (nextIndex < queue.length) {
+            const [src, images] = queue[nextIndex++]
+            try {
+                const newSrc = await resolve(src)
+                if (newSrc) images.forEach(image => image.replace(newSrc))
+            }
+            catch (error) {
+                console.error('Failed to fetch image asset', error)
+            }
+        }
+    }
+
+    await Promise.all(Array.from(
+        { length: Math.min(IMAGE_SOURCE_CONCURRENCY, queue.length) },
+        worker,
+    ))
+}
+
+/** avoid errors in parsing multimodal parts we don't understand */
+function replaceImageAssets(conversation: ApiConversation): Promise<void> {
+    return replaceImageSources(conversation, async (src) => {
+        if (!src.startsWith('sediment://')) return null
+        return fetchImageFromPointer(src)
+    })
+}
+
+export async function fetchConversation(chatId: string): Promise<ApiConversationWithId> {
+    if (chatId.startsWith('__share__')) {
+        const id = chatId.replace('__share__', '')
+        const shareConversation = await loadShareConversation(
+            getConversationFromSharePage(),
+            () => fetchApi<ApiConversation>(shareConversationApi(id)),
+        )
+
+        return {
+            id,
+            ...shareConversation,
+        }
+    }
+
+    const url = conversationApi(chatId)
+    const conversation = await fetchApi<ApiConversation>(url)
+
+    return {
+        id: chatId,
+        ...conversation,
+    }
+}
+
+export async function fetchProjects(): Promise<ApiProjectInfo[]> {
+    let cursor: number | null = null
+    const allItems: ApiGizmo[] = []
+    while (true) {
+        const url = projectsApi(cursor)
+        const { items, cursor: nextCursor = null } = await fetchApi<{ cursor: number | null, items: ApiGizmo[] }>(url)
+        cursor = nextCursor
+        allItems.push(...items)
+        if (nextCursor === null) break
+    }
+
+    return allItems.map(gizmo => (gizmo.gizmo.gizmo))
+}
+
+async function fetchConversations(offset = 0, limit = 20, project: string | null = null): Promise<ApiConversations> {
+    if (project) {
+        return fetchProjectConversations(project, offset, limit)
+    }
+    const url = conversationsApi(offset, limit)
+    const page = await fetchApi<ApiConversations>(url)
+    return normalizeConversationPage(page, offset, limit, false)
+}
+
+async function fetchProjectConversations(project: string, cursor: string | number = 0, limit = 20, offset = 0): Promise<ApiConversations> {
+    const url = projectConversationsApi(project, cursor, limit)
+    const page = await fetchApi<{ items: ApiConversationItem[], cursor: string | null }>(url)
+    return normalizeConversationPage({
+        has_missing_conversations: false,
+        items: page?.items,
+        limit,
+        offset,
+        total: null,
+        cursor: page?.cursor ?? null,
+    }, offset, limit, true)
+}
+
+function normalizeConversationPage(page: ApiConversations, offset: number, limit: number, project: boolean): ApiConversations {
+    if (!page || !Array.isArray(page.items) || page.items.some(item => !item || typeof item.id !== 'string' || !item.id)) {
+        throw new Error('ChatGPT returned an invalid conversation list. Please retry loading.')
+    }
+    const nextOffset = offset + page.items.length
+    const total = typeof page.total === 'number' && Number.isFinite(page.total) ? page.total : null
+    const hasMore = project
+        ? page.cursor != null
+        : page.has_more ?? (total != null ? nextOffset < total : page.items.length > 0)
+    if (page.items.length === 0 && hasMore) {
+        throw new Error('ChatGPT returned an empty page while more conversations remain. Please retry loading.')
+    }
+    return {
+        ...page,
+        offset,
+        limit,
+        total,
+        next_offset: nextOffset,
+        has_more: hasMore,
+    }
+}
+
+/**
+ * Fetch a single page of conversations starting at `offset`.
+ * Useful for "load more" functionality in the UI — call this after the initial
+ * full load to append additional pages without re-fetching everything.
+ */
+export async function fetchConversationsPage(
+    project: string | null,
+    offset: number,
+    limit: number,
+    cursor?: string | null,
+): Promise<ApiConversations> {
+    const pageSize = Math.max(1, Math.min(limit, project === null ? 100 : 50))
+    if (project) {
+        if (offset > 0 && !cursor) throw new Error('Project pagination cursor is missing. Reopen the export window to reload this project.')
+        return fetchProjectConversations(project, cursor ?? 0, pageSize, offset)
+    }
+    return fetchConversations(offset, pageSize)
+}
+
+export async function fetchAllConversations(
+    project: string | null = null,
+    maxConversations = 1000,
+    onBatch?: (batch: ApiConversationItem[]) => void,
+    onHasMore?: (hasMore: boolean) => void,
+    onError?: (error: unknown) => void,
+    onPosition?: (position: ConversationPagePosition) => void,
+): Promise<ApiConversationItem[]> {
+    const conversations: ApiConversationItem[] = []
+    const seen = new Set<string>()
+    const cursors = new Set<string>()
+    let position: ConversationPagePosition = { offset: 0 }
+    let hasMore = true
+    onPosition?.(position)
+    try {
+        while (hasMore && conversations.length < maxConversations) {
+            const page = await fetchConversationsPage(project, position.offset, maxConversations - conversations.length, position.cursor)
+            const novel = page.items.filter((item) => {
+                if (seen.has(item.id)) return false
+                seen.add(item.id)
+                return true
+            })
+            if (page.has_more && (novel.length === 0 || (project && page.cursor && cursors.has(page.cursor)))) {
+                throw new Error('ChatGPT pagination made no progress. Loaded conversations remain available; please retry loading.')
+            }
+            hasMore = page.has_more ?? false
+            if (page.cursor) cursors.add(page.cursor)
+            position = { offset: page.next_offset!, cursor: page.cursor }
+            conversations.push(...novel)
+            onPosition?.(position)
+            if (novel.length > 0) onBatch?.(novel)
+        }
+    }
+    catch (error) {
+        if (!onError) throw error
+        onError(error)
+    }
+    finally {
+        onHasMore?.(hasMore)
+    }
+    return conversations
+}
+
+/**
+ * Fetch conversations from every source: the main conversation list (no-project)
+ * plus each project's own list.  Deduplicates by ID so a conversation that
+ * appears in both won't be exported twice.
+ */
+export async function fetchAllConversationsAll(
+    projects: ApiProjectInfo[],
+    maxConversations = 1000,
+    onBatch?: (batch: ApiConversationItem[]) => void,
+): Promise<void> {
+    const seen = new Set<string>()
+    const notify = (items: ApiConversationItem[]) => {
+        const novel = items.filter(c => !seen.has(c.id))
+        for (const c of novel) seen.add(c.id)
+        if (novel.length > 0) onBatch?.(novel)
+    }
+    // Main conversation list first (no-project or all, depending on the API)
+    await fetchAllConversations(null, maxConversations, notify)
+    // Then each project's conversations
+    for (const project of projects) {
+        await fetchAllConversations(project.id, maxConversations, notify)
+    }
+}
+
+export async function archiveConversation(chatId: string): Promise<boolean> {
+    const url = conversationApi(chatId)
+    const { success } = await fetchApi<{ success: boolean }>(url, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_archived: true }),
+    })
+    return success
+}
+
+export async function deleteConversation(chatId: string): Promise<boolean> {
+    const url = conversationApi(chatId)
+    const { success } = await fetchApi<{ success: boolean }>(url, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ is_visible: false }),
+    })
+    return success
+}
+
+/**
+ * Thrown when the API responds with 429 Too Many Requests.
+ * Carries the wait time from the `Retry-After` header (or a safe default).
+ */
+export class RateLimitError extends Error {
+    /** Milliseconds to wait before retrying */
+    readonly retryAfterMs: number
+    /** Whether `retryAfterMs` came from `Retry-After` rather than the fallback */
+    readonly retryAfterFromServer: boolean
+    constructor(retryAfterHeader: string | null) {
+        super('Too Many Requests (429)')
+        this.name = 'RateLimitError'
+        const secs = retryAfterHeader != null ? Number.parseInt(retryAfterHeader, 10) : Number.NaN
+        this.retryAfterFromServer = Number.isFinite(secs) && secs > 0
+        // Default to 30 s if the header is missing or unparseable
+        this.retryAfterMs = this.retryAfterFromServer ? secs * 1000 : 30_000
+    }
+}
+
+/** Header names ChatGPT might use for rate-limit signalling */
+const RATE_LIMIT_HEADERS = [
+    'retry-after',
+    'x-ratelimit-limit-requests',
+    'x-ratelimit-remaining-requests',
+    'x-ratelimit-reset-requests',
+    'x-ratelimit-limit-tokens',
+    'x-ratelimit-remaining-tokens',
+    'x-ratelimit-reset-tokens',
+]
+
+function logRateLimitHeaders(response: Response) {
+    const found: Record<string, string> = {}
+    for (const h of RATE_LIMIT_HEADERS) {
+        const val = response.headers.get(h)
+        if (val != null) found[h] = val
+    }
+    if (Object.keys(found).length > 0) {
+        // eslint-disable-next-line no-console
+        console.info('[Exporter] Rate-limit headers:', found)
+    }
+}
+
+async function fetchApi<T>(url: string, options?: RequestInit, retryAuthentication = true): Promise<T> {
+    const accessToken = await getAccessToken()
+    const accountId = await getTeamAccountId()
+
+    const response = await fetch(url, {
+        ...options,
+        credentials: 'same-origin',
+        headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'X-Authorization': `Bearer ${accessToken}`,
+            ...(accountId ? { 'Chatgpt-Account-Id': accountId } : {}),
+            ...options?.headers,
+        },
+    })
+
+    logRateLimitHeaders(response)
+
+    if (!response.ok) {
+        if (response.status === 429) {
+            throw new RateLimitError(response.headers.get('Retry-After'))
+        }
+        if (response.status === 401 && retryAuthentication) {
+            sessionPromise = null
+            return fetchApi<T>(url, options, false)
+        }
+        if (response.status === 401) throw new Error('ChatGPT login expired. Sign in again and refresh this page.')
+        if (response.status === 403) throw new Error('ChatGPT denied this request (403). Complete any verification on the website, then retry.')
+        throw new Error(`ChatGPT request failed (${response.status}): ${response.statusText || 'Request failed'}`)
+    }
+    try {
+        return await response.json() as T
+    }
+    catch {
+        throw new Error('ChatGPT did not return JSON. Refresh the page and complete any sign-in or verification prompt.')
+    }
+}
+
+/**
+ * Lightweight probe: fetch exactly 1 conversation to check whether the API
+ * is currently accepting requests. Returns a status object that the UI can
+ * display before the user starts a large export.
+ */
+export async function probeApi(): Promise<{
+    ok: boolean
+    retryAfterMs?: number
+    rateLimitHeaders: Record<string, string>
+}> {
+    const accessToken = await getAccessToken()
+    const accountId = await getTeamAccountId()
+    const url = conversationsApi(0, 1)
+
+    const response = await fetch(url, {
+        headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'X-Authorization': `Bearer ${accessToken}`,
+            ...(accountId ? { 'Chatgpt-Account-Id': accountId } : {}),
+        },
+    })
+
+    const rateLimitHeaders: Record<string, string> = {}
+    for (const h of RATE_LIMIT_HEADERS) {
+        const val = response.headers.get(h)
+        if (val != null) rateLimitHeaders[h] = val
+    }
+
+    if (!response.ok) {
+        if (response.status === 429) {
+            const secs = response.headers.get('retry-after')
+            const ms = secs ? Number.parseInt(secs, 10) * 1000 : 60_000
+            return { ok: false, retryAfterMs: ms, rateLimitHeaders }
+        }
+        return { ok: false, rateLimitHeaders }
+    }
+
+    return { ok: true, rateLimitHeaders }
+}
+
+async function _fetchSession(): Promise<ApiSession> {
+    const response = await fetch(sessionApi, { credentials: 'same-origin' })
+    if (!response.ok) {
+        throw new Error(`Unable to read the ChatGPT login session (${response.status}). Sign in and refresh the page.`)
+    }
+    const session = await response.json() as ApiSession
+    if (typeof session.accessToken !== 'string' || !session.accessToken) {
+        throw new Error('No ChatGPT login session was found. Sign in and refresh the page.')
+    }
+    return session
+}
+
+function fetchSession(): Promise<ApiSession> {
+    if (!sessionPromise || Date.now() - sessionCachedAt >= 60_000) {
+        sessionCachedAt = Date.now()
+        const pending = _fetchSession().catch((error) => {
+            if (sessionPromise === pending) sessionPromise = null
+            throw error
+        })
+        sessionPromise = pending
+    }
+    return sessionPromise
+}
+
+async function getAccessToken(): Promise<string> {
+    const session = await fetchSession()
+    return session.accessToken
+}
+
+async function _fetchAccountsCheck(accessToken: string): Promise<ApiAccountsCheck> {
+    const response = await fetch(accountsCheckApi, {
+        headers: {
+            'Authorization': `Bearer ${accessToken}`,
+            'X-Authorization': `Bearer ${accessToken}`,
+        },
+    })
+    if (!response.ok) {
+        throw new Error(response.statusText)
+    }
+    return response.json()
+}
+
+let accountsCache: { token: string, cachedAt: number, promise: Promise<ApiAccountsCheck> } | null = null
+
+function fetchAccountsCheck(token: string): Promise<ApiAccountsCheck> {
+    if (!accountsCache || accountsCache.token !== token || Date.now() - accountsCache.cachedAt >= 60_000) {
+        const promise = _fetchAccountsCheck(token).catch((error) => {
+            if (accountsCache?.promise === promise) accountsCache = null
+            throw error
+        })
+        accountsCache = { token, cachedAt: Date.now(), promise }
+    }
+    return accountsCache.promise
+}
+
+const getCookie = (key: string) => document.cookie.match(`(^|;)\\s*${key}\\s*=\\s*([^;]+)`)?.pop() || ''
+
+export async function getTeamAccountId(): Promise<string | null> {
+    const workspaceId = getCookie(ChatGPTCookie.Workspace)
+    if (workspaceId) {
+        const accountsCheck = await fetchAccountsCheck(await getAccessToken())
+        const account = accountsCheck.accounts[workspaceId]
+        if (account) {
+            return account.account.account_id
+        }
+        throw new Error('Unable to identify the current ChatGPT workspace. Refresh the page before exporting.')
+    }
+
+    return null
+}
+
+export interface ConversationResult {
+    id: string
+    title: string
+    modelSlug: string
+    model: string
+    createTime: number
+    updateTime: number
+    conversationNodes: ConversationNode[]
+    projectName?: string
+    projectId?: string
+}
+
+/**
+ * Names of the files uploaded with a message. Their content lives in hidden
+ * tool messages, which exports skip. Images are left out, they already show
+ * as image parts of the message.
+ */
+export function getFileAttachmentNames(message: ConversationNodeMessage): string[] {
+    return (message.metadata?.attachments ?? [])
+        .filter(attachment => attachment.name && !attachment.mime_type?.startsWith('image/'))
+        .map(attachment => attachment.name)
+}
+
+export function shouldSkipMessageInExport(message?: ConversationNodeMessage): boolean {
+    if (!message || !message.content) return true
+
+    // ChatGPT is talking to tool
+    if (message.recipient != null && message.recipient !== 'all') return true
+
+    // Skip "thinking" content (hidden reasoning steps from thinking models)
+    if (message.content.content_type === 'thoughts') return true
+    if (message.content.content_type === 'reasoning_recap') return true
+
+    // Skip messages marked as visually hidden (e.g., internal system prompts)
+    if (message.metadata?.is_visually_hidden_from_conversation) return true
+
+    // Skip transient assistant preambles shown while a thinking response is being prepared.
+    if (message.metadata?.is_thinking_preamble_message) return true
+
+    // Skip empty replies, such as the answer after an image generation.
+    if (
+        message.author.role === 'assistant'
+        && message.content.content_type === 'text'
+        && !message.content.parts.join('').trim()
+    ) return true
+
+    // Skip tool's intermediate message.
+    if (message.author.role === 'tool') {
+        if (message.author.name === 'file_search') return true
+
+        const hasExecutionImages = message.content.content_type === 'execution_output'
+            && !!message.metadata?.aggregate_result?.messages?.some(msg => msg.message_type === 'image')
+
+        const hasMultimodalImage = message.content.content_type === 'multimodal_text'
+            && message.content.parts.some((part) => {
+                return typeof part !== 'string'
+                    && part.content_type === 'image_asset_pointer'
+            })
+
+        if (!hasExecutionImages && !hasMultimodalImage) {
+            return true
+        }
+    }
+
+    return false
+}
+
+export interface ProcessConversationOptions {
+    enableThinking?: boolean
+}
+
+export function processConversation(conversation: ApiConversationWithId, options?: ProcessConversationOptions): ConversationResult {
+    const title = conversation.title || 'ChatGPT Conversation'
+    const createTime = conversation.create_time
+    const updateTime = conversation.update_time
+    const startNodeId = conversation.current_node
+        || Object.values(conversation.mapping).find(node => !node.children || node.children.length === 0)?.id
+    if (!startNodeId) throw new Error('Failed to find start node.')
+
+    const conversationNodes = extractConversationResult(conversation.mapping, startNodeId)
+    const { model, modelSlug } = extractModel(conversation.mapping, conversationNodes)
+    const mergedConversationNodes = mergeContinuationNodes(conversationNodes)
+
+    if (options?.enableThinking) {
+        attachThinkingToNodes(conversation.mapping, mergedConversationNodes, startNodeId)
+    }
+
+    return {
+        id: conversation.id,
+        title,
+        model,
+        modelSlug,
+        createTime,
+        updateTime,
+        conversationNodes: mergedConversationNodes,
+    }
+}
+
+function extractModel(conversationMapping: Record<string, ConversationNode>, conversationNodes: ConversationNode[]) {
+    // Prefer the latest reply on the current branch, the model can change mid-conversation.
+    const node = conversationNodes.findLast(node => node.message?.metadata?.model_slug)
+        ?? Object.values(conversationMapping).find(node => node.message?.metadata?.model_slug)
+    const modelSlug = node?.message?.metadata?.model_slug ?? ''
+
+    return {
+        model: getModelName(modelSlug),
+        modelSlug,
+    }
+}
+
+function extractConversationResult(conversationMapping: Record<string, ConversationNode>, startNodeId: string): ConversationNode[] {
+    const result: ConversationNode[] = []
+    let currentNodeId: string | undefined = startNodeId
+
+    while (currentNodeId) {
+        const node: ConversationNode = conversationMapping[currentNodeId]
+        if (!node) {
+            break // Node not found
+        }
+
+        if (node.parent === undefined) {
+            break // Stop at root message.
+        }
+
+        if (
+            // Skip system messages
+            node.message?.author.role !== 'system'
+            // Skip model memory context
+            && node.message?.content.content_type !== 'model_editable_context'
+            // Skip user custom instructions
+            && node.message?.content.content_type !== 'user_editable_context'
+            // Skip hidden/tool-only messages that should not appear in exported output
+            && !shouldSkipMessageInExport(node.message)
+        ) {
+            result.unshift(copyNode(node))
+        }
+
+        currentNodeId = node.parent
+    }
+
+    return result
+}
+
+/**
+ * Merge continuation nodes generated by official continuation
+ * to improve the readability of the conversation. (#146)
+ */
+/**
+ * Copy the parts of a node that `mergeContinuationNodes` and
+ * `attachThinkingToNodes` write to, so processing leaves the raw mapping
+ * intact. The same raw conversation can be exported more than once.
+ */
+function copyNode(node: ConversationNode): ConversationNode {
+    const { message } = node
+    if (!message) return { ...node }
+
+    const content = message.content.content_type === 'text'
+        ? { ...message.content, parts: getInteractiveFallbackParts(message) ?? [...message.content.parts] }
+        : message.content
+
+    return {
+        ...node,
+        message: {
+            ...message,
+            content,
+            metadata: message.metadata && { ...message.metadata },
+        },
+    }
+}
+
+/**
+ * Interactive replies keep a JSX-like widget markup in `parts`, such as
+ * `<box>` and `DIL.useState(...)`. Export the Markdown version ChatGPT
+ * stores next to it instead.
+ */
+function getInteractiveFallbackParts(message: ConversationNodeMessage): string[] | null {
+    const markdown = message.metadata?.model_dil_v2?.fallbackMarkdown
+    if (typeof markdown !== 'string' || !markdown.trim() || message.content.content_type !== 'text') return null
+
+    // The markup ends with the blank line that separates this reply from the
+    // next one when they are merged, but the Markdown is trimmed.
+    const markup = message.content.parts.join('')
+    const leading = markup.slice(0, markup.length - markup.trimStart().length)
+    const trailing = markup.slice(markup.trimEnd().length)
+
+    // `<escape>` wraps a literal character, such as `<` in inline code.
+    return [leading + markdown.replaceAll(/<escape>([\s\S]*?)<\/escape>/g, '$1') + trailing]
+}
+
+function mergeContinuationNodes(nodes: ConversationNode[]): ConversationNode[] {
+    const result: ConversationNode[] = []
+    for (const node of nodes) {
+        const prevNode = result[result.length - 1]
+        if (
+            prevNode?.message?.author.role === 'assistant' && node.message?.author.role === 'assistant'
+            && prevNode.message.recipient === 'all' && node.message.recipient === 'all'
+            && prevNode.message.content.content_type === 'text' && node.message.content.content_type === 'text'
+        ) {
+            const separator = prevNode.message.channel !== node.message.channel ? '\n\n' : ''
+            prevNode.message.content.parts[prevNode.message.content.parts.length - 1] += separator + node.message.content.parts[0]
+            prevNode.message.content.parts.push(...node.message.content.parts.slice(1))
+
+            if (node.message.metadata) {
+                const prevMeta = (prevNode.message.metadata ??= {} as any)
+                if (node.message.metadata.citations?.length) {
+                    prevMeta.citations = [
+                        ...(prevMeta.citations || []),
+                        ...node.message.metadata.citations,
+                    ]
+                }
+                if (node.message.metadata.content_references?.length) {
+                    prevMeta.content_references = [
+                        ...(prevMeta.content_references || []),
+                        ...node.message.metadata.content_references,
+                    ]
+                }
+            }
+        }
+        else {
+            result.push(node)
+        }
+    }
+    return result
+}
+
+/**
+ * Walk the raw conversation mapping and attach thinking/reasoning content
+ * to the corresponding assistant response nodes.
+ */
+function hasThinkingContent(thinking: ThinkingContent): boolean {
+    return thinking.thoughts.length > 0
+        || (thinking.activities != null && thinking.activities.length > 0)
+}
+
+function attachThinkingToNodes(
+    mapping: Record<string, ConversationNode>,
+    resultNodes: ConversationNode[],
+    startNodeId: string,
+): void {
+    const resultNodeIds = new Set(resultNodes.map(n => n.id))
+
+    let currentNodeId: string | undefined = startNodeId
+    let targetNodeId: string | null = null
+    let thinking: ThinkingContent = { thoughts: [] }
+
+    while (currentNodeId) {
+        const node: ConversationNode = mapping[currentNodeId]
+        if (!node || node.parent === undefined) break
+
+        const message = node.message
+        if (message?.content) {
+            const ct = message.content.content_type
+
+            if (resultNodeIds.has(node.id) && message.author.role !== 'user') {
+                if (hasThinkingContent(thinking)) {
+                    const saveToId = targetNodeId ?? node.id
+                    const target = resultNodes.find(n => n.id === saveToId)
+                    if (target) target.thinking = thinking
+                }
+                targetNodeId = node.id
+                thinking = { thoughts: [] }
+            }
+            else if (ct === 'reasoning_recap') {
+                const duration = message.metadata?.finished_duration_sec
+                if (typeof duration === 'number') {
+                    thinking.durationSeconds = duration
+                }
+                else {
+                    const match = message.content.content.match(/(\d+)/)
+                    if (match) thinking.durationSeconds = Number.parseInt(match[1])
+                }
+            }
+            else if (ct === 'thoughts') {
+                // The walk goes from leaf to root, so prepend each message's thoughts as a batch to keep their order.
+                thinking.thoughts.unshift(...message.content.thoughts
+                    .filter(thought => thought.content || thought.summary)
+                    .map(thought => ({ summary: thought.summary, content: thought.content })))
+            }
+            else if (ct === 'text' && message.metadata?.is_thinking_preamble_message) {
+                // Progress notes the model writes between reasoning steps, shown in ChatGPT's thinking panel.
+                const content = message.content.parts.join('\n')
+                if (content) thinking.thoughts.unshift({ summary: '', content })
+            }
+            else if (message.metadata?.reasoning_title) {
+                if (!thinking.activities) thinking.activities = []
+                // Repeated titles keep their first position, the walk sees them last.
+                const title = message.metadata.reasoning_title
+                const index = thinking.activities.indexOf(title)
+                if (index !== -1) thinking.activities.splice(index, 1)
+                thinking.activities.unshift(title)
+            }
+            else if (message.author.role === 'user' && !message.metadata?.is_visually_hidden_from_conversation) {
+                if (targetNodeId && hasThinkingContent(thinking)) {
+                    const target = resultNodes.find(n => n.id === targetNodeId)
+                    if (target) target.thinking = thinking
+                }
+                targetNodeId = null
+                thinking = { thoughts: [] }
+            }
+        }
+
+        currentNodeId = node.parent
+    }
+
+    if (targetNodeId && hasThinkingContent(thinking)) {
+        const target = resultNodes.find(n => n.id === targetNodeId)
+        if (target) target.thinking = thinking
+    }
+}

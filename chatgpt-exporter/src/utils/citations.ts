@@ -1,0 +1,293 @@
+import type { ContentReference, ContentReferenceSource, ConversationNodeMessage } from '../api'
+
+type CitationOutput = 'markdown' | 'text'
+
+interface TransformContentReferenceOptions {
+    output?: CitationOutput
+    inlineReferenceMode?: 'expanded' | 'alt'
+    includeSourceList?: boolean
+    sourceListLabel?: string
+}
+
+const CitationMarkerRegex = /\uE200cite(?:\uE202[^\uE200\uE201]*)+\uE201/gu
+/**
+ * An inline link, `urlLabelhttps://\u2026`. The Markdown version of an
+ * interactive reply has these without a content reference.
+ */
+const UrlMarkerRegex = /\uE200url\uE202([^\uE200\uE201\uE202]*)\uE202([^\uE200\uE201\uE202]+)\uE201/gu
+/**
+ * A named place, person or business, `entity["turn0business0","Name"]`.
+ * ChatGPT shows only the name. Interactive replies have these without a
+ * content reference too.
+ */
+const EntityMarkerRegex = /\uE200entity\uE202([^\uE200\uE201]*)\uE201/gu
+/** An image carousel. Without a content reference there are no images to show. */
+const ImageGroupMarkerRegex = /\uE200image_group\uE202[^\uE200\uE201]*\uE201/gu
+
+export function normalizeCitationText(input: string): string {
+    return input
+        .replaceAll(/[\u00A0\u202F\u2007\u2060]/gu, ' ')
+        .replaceAll(/[\u2010-\u2015\u2212]/gu, '-')
+        .replaceAll(/[\uE203\uE204]/gu, '')
+}
+
+export function transformContentReferences(
+    input: string,
+    metadata: ConversationNodeMessage['metadata'],
+    options: TransformContentReferenceOptions = {},
+): string {
+    const outputType = options.output ?? 'markdown'
+    const inlineReferenceMode = options.inlineReferenceMode ?? 'expanded'
+    const contentRefs = metadata?.content_references ?? []
+    let output = normalizeCitationText(input)
+
+    const sortedRefs = [...contentRefs]
+        .filter(ref => ref.type !== 'sources_footnote')
+        .sort((a, b) => (b.matched_text?.length || 0) - (a.matched_text?.length || 0))
+
+    const fileReplacements = new Set<string>()
+    for (const ref of sortedRefs) {
+        if (!ref.matched_text) continue
+        // ChatGPT draws these code blocks as widgets, but the text already has their Markdown.
+        if (ref.type === 'client_defined_widget' && ref.data?.widget_type === 'code_block') continue
+        // The marker itself has the link, see UrlMarkerRegex
+        if (ref.type === 'url') continue
+
+        const matchedText = normalizeCitationText(ref.matched_text)
+        if (!matchedText) continue
+
+        const replacement = formatInlineReference(ref, outputType, inlineReferenceMode)
+        output = output.replaceAll(matchedText, () => replacement)
+        if (ref.type === 'file' && replacement) fileReplacements.add(replacement)
+    }
+
+    // Citations of different lines in the same file would repeat its name
+    for (const replacement of fileReplacements) {
+        const escaped = escapeRegExp(replacement)
+        output = output.replaceAll(new RegExp(`${escaped}(?:\\s*${escaped})+`, 'g'), () => replacement)
+    }
+
+    // Alt text is Markdown, as ChatGPT writes it
+    const linkOutput = inlineReferenceMode === 'alt' ? 'markdown' : outputType
+    output = output.replaceAll(UrlMarkerRegex, (_, label: string, url: string) => {
+        return formatCitationSource({ title: label, url }, linkOutput)
+    })
+    output = output.replaceAll(EntityMarkerRegex, (marker, data: string) => {
+        const name = parseEntityName(data)
+        if (name === null) return marker
+        return linkOutput === 'markdown' ? escapeMarkdownText(name) : name
+    })
+    output = output.replace(ImageGroupMarkerRegex, '')
+
+    output = output.replace(CitationMarkerRegex, '')
+
+    if (options.includeSourceList !== false) {
+        const sources = getSourcesFootnoteSources(contentRefs)
+        if (sources.length > 0) {
+            output = appendSourcesSection(output, sources, outputType, options.sourceListLabel ?? 'Sources')
+        }
+    }
+
+    return output.replace(/[\uE200-\uE20F]/g, '')
+}
+
+function parseEntityName(data: string): string | null {
+    try {
+        const parsed: unknown = JSON.parse(data)
+        if (Array.isArray(parsed) && typeof parsed[1] === 'string') return parsed[1]
+    }
+    catch {}
+    return null
+}
+
+export function formatCitationSource(source: ContentReferenceSource, output: CitationOutput): string {
+    const label = getSourceLabel(source)
+    const url = source.url?.trim()
+
+    if (!url) return output === 'markdown' ? escapeMarkdownText(label) : label
+
+    if (output === 'text') {
+        return `${label}: ${url}`
+    }
+
+    return `[${escapeMarkdownText(label)}](<${escapeMarkdownUrl(url)}>)`
+}
+
+function formatInlineReference(ref: ContentReference, output: CitationOutput, mode: 'expanded' | 'alt'): string {
+    if (ref.type === 'client_defined_widget' && ref.data?.widget_type === 'charts_widget_v2') {
+        return formatChart(ref.data.content as ChartContent | undefined)
+    }
+
+    if (mode === 'alt') return formatAlt(ref.alt)
+
+    if (output === 'markdown' && (ref.type === 'image_group' || ref.type === 'image_v2')) {
+        const images = formatImageResults(ref)
+        if (images) return images
+        return formatAlt(ref.alt)
+    }
+
+    const sources = getInlineSources(ref)
+
+    if (sources.length > 0) {
+        const separator = output === 'markdown' ? ', ' : '; '
+        return `(${sources.map(source => formatCitationSource(source, output)).join(separator)})`
+    }
+
+    return formatAlt(ref.alt)
+}
+
+/**
+ * Image search results, shown by ChatGPT as a carousel. Link each image to
+ * the page it comes from, with the page title as alt text.
+ */
+function formatImageResults(ref: ContentReference): string {
+    return (ref.images ?? [])
+        .map((entry) => {
+            const image = entry.image_result ?? entry
+            const src = image.content_url?.trim()
+            if (!src) return ''
+
+            const markdown = `![${escapeMarkdownText(image.title?.trim() || 'Image')}](<${escapeMarkdownUrl(src)}>)`
+            const page = image.url?.trim()
+            return page ? `[${markdown}](<${escapeMarkdownUrl(page)}>)` : markdown
+        })
+        .filter(Boolean)
+        .join('\n\n')
+}
+
+interface ChartContent {
+    meta?: { description?: string }
+    xKey?: string
+    series?: Array<{ dataKey: string, label?: string, valueSuffix?: string }>
+    data?: Array<Record<string, unknown>>
+    /** `data` with units, such as `63.4%` */
+    formattedData?: Array<Record<string, unknown>>
+}
+
+/** A chart becomes its description and a table of its data. */
+function formatChart(chart: ChartContent | undefined): string {
+    const { meta, xKey, series = [], data = [], formattedData } = chart ?? {}
+    if (!xKey || series.length === 0 || data.length === 0) return ''
+
+    const cell = (value: unknown) => String(value ?? '').replaceAll('|', '\\|').replaceAll('\n', ' ')
+    const row = (cells: unknown[]) => `| ${cells.map(cell).join(' | ')} |`
+    const rows = data.map((point, index) => row([
+        point[xKey],
+        ...series.map(({ dataKey, valueSuffix = '' }) => formattedData?.[index]?.[dataKey]
+            ?? (point[dataKey] == null ? '' : `${point[dataKey]}${valueSuffix}`)),
+    ]))
+    const table = [
+        row([xKey, ...series.map(({ dataKey, label }) => label || dataKey)]),
+        row([xKey, ...series].map(() => '---')),
+        ...rows,
+    ].join('\n')
+
+    const description = meta?.description?.trim()
+    return description ? `${description}\n\n${table}` : table
+}
+
+/**
+ * Product references carry links without a URL, such as `[Product name]()`.
+ * Keep their label only.
+ */
+function formatAlt(alt: string | undefined): string {
+    return alt?.replaceAll(/\[([^\]]*)\]\(\)/g, '$1') ?? ''
+}
+
+function getInlineSources(ref: ContentReference): ContentReferenceSource[] {
+    const sources: ContentReferenceSource[] = []
+
+    for (const item of ref.items ?? []) {
+        sources.push(item)
+        sources.push(...(item.supporting_websites ?? []))
+    }
+
+    sources.push(...(ref.fallback_items ?? []))
+
+    // Uploaded files have no URL, show their name as ChatGPT does
+    if (sources.length === 0 && ref.type === 'file' && ref.name) {
+        sources.push({ title: ref.name })
+    }
+
+    if (sources.length === 0 && (ref.url || ref.title || ref.attribution)) {
+        sources.push(ref)
+    }
+
+    // Product references list an empty URL here
+    const safeUrls = ref.safe_urls?.filter(Boolean) ?? []
+    if (sources.length === 0 && safeUrls.length) {
+        sources.push(...safeUrls.map(url => ({ title: url, url })))
+    }
+
+    return dedupeSources(sources)
+}
+
+function getSourcesFootnoteSources(contentRefs: ContentReference[]): ContentReferenceSource[] {
+    const sources = contentRefs
+        .filter(ref => ref.type === 'sources_footnote')
+        .flatMap((ref) => {
+            if (ref.sources?.length) return ref.sources
+            if (ref.items?.length) return ref.items
+            if (ref.fallback_items?.length) return ref.fallback_items
+            if (ref.safe_urls?.length) return ref.safe_urls.map(url => ({ title: url, url }))
+            return []
+        })
+
+    return dedupeSources(sources)
+}
+
+function appendSourcesSection(input: string, sources: ContentReferenceSource[], output: CitationOutput, label: string): string {
+    const trimmed = input.trimEnd()
+    const sourceList = output === 'markdown'
+        ? [
+                `**${escapeMarkdownText(label)}:**`,
+                '',
+                ...sources.map(source => `- ${formatCitationSource(source, output)}`),
+            ].join('\n')
+        : [
+                `${label}:`,
+                ...sources.map((source, index) => `${index + 1}. ${formatCitationSource(source, output)}`),
+            ].join('\n')
+
+    return trimmed ? `${trimmed}\n\n${sourceList}` : sourceList
+}
+
+function dedupeSources(sources: ContentReferenceSource[]): ContentReferenceSource[] {
+    const seen = new Set<string>()
+    const result: ContentReferenceSource[] = []
+
+    for (const source of sources) {
+        const key = source.url?.trim() || getSourceLabel(source)
+        if (!key || seen.has(key)) continue
+        seen.add(key)
+        result.push(source)
+    }
+
+    return result
+}
+
+function getSourceLabel(source: ContentReferenceSource): string {
+    return source.attribution?.trim()
+        || source.title?.trim()
+        || source.url?.trim()
+        || 'Source'
+}
+
+function escapeMarkdownText(input: string): string {
+    return input
+        .replaceAll('\\', '\\\\')
+        .replaceAll('[', '\\[')
+        .replaceAll(']', '\\]')
+        .replaceAll('\n', ' ')
+}
+
+function escapeMarkdownUrl(input: string): string {
+    return input
+        .replaceAll('<', '%3C')
+        .replaceAll('>', '%3E')
+        .replaceAll('\n', '')
+}
+
+function escapeRegExp(input: string): string {
+    return input.replaceAll(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}

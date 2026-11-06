@@ -1,0 +1,280 @@
+import JSZip from 'jszip'
+import { fetchConversation, getCurrentChatId, getFileAttachmentNames, processConversation, shouldSkipMessageInExport, withImageAssets } from '../api'
+import { KEY_SOURCES_ENABLED, KEY_THINKING_ENABLED, KEY_TIMESTAMP_24H, KEY_TIMESTAMP_ENABLED, KEY_TIMESTAMP_HTML, baseUrl } from '../constants'
+import i18n from '../i18n'
+import { checkIfConversationStarted, getUserAvatar } from '../page'
+import templateHtml from '../template.html?raw'
+import { checkIfTemporaryChatIsExportable } from '../temporaryChat'
+import { transformContentReferences } from '../utils/citations'
+import { buildZipFileName, downloadFile, getFileNameWithFormat } from '../utils/download'
+import { protectMath, toBracketDelimiters } from '../utils/latex'
+import { formatDurationSeconds } from '../utils/duration'
+import { toHtml } from '../utils/markdown'
+import { ScriptStorage } from '../utils/storage'
+import { standardizeLineBreaks } from '../utils/text'
+import { dateStr, getColorScheme } from '../utils/utils'
+import { transformAuthor } from '../utils/author'
+import type { ApiConversationWithId, ConversationNodeMessage, ConversationResult, ThinkingContent } from '../api'
+import type { ExportMeta } from '../ui/SettingContext'
+import type { PartInfo } from '../utils/download'
+import { escapeHtml, fillTemplate, metaDetailsHtml } from './htmlTemplate'
+import { getMetaVariables, resolveMetaList } from './meta'
+
+export async function exportToHtml(fileNameFormat: string, metaList: ExportMeta[]) {
+    if (!checkIfConversationStarted()) {
+        alert(i18n.t('Please start a conversation first'))
+        return false
+    }
+
+    if (!checkIfTemporaryChatIsExportable()) {
+        alert(i18n.t('Temporary chat could not be captured'))
+        return false
+    }
+
+    const userAvatar = await getUserAvatar()
+
+    const chatId = await getCurrentChatId()
+    const rawConversation = await withImageAssets(await fetchConversation(chatId))
+    const enableThinking = ScriptStorage.get<boolean>(KEY_THINKING_ENABLED) ?? false
+    const conversation = processConversation(rawConversation, { enableThinking })
+    const html = conversationToHtml(conversation, userAvatar, metaList)
+
+    const fileName = getFileNameWithFormat(fileNameFormat, 'html', { title: conversation.title, chatId, createTime: conversation.createTime, updateTime: conversation.updateTime })
+    downloadFile(fileName, 'text/html', standardizeLineBreaks(html))
+
+    return true
+}
+
+export async function exportAllToHtml(fileNameFormat: string, apiConversations: ApiConversationWithId[], metaList?: ExportMeta[], projectName?: string, partIndex?: number, totalParts?: number) {
+    const userAvatar = await getUserAvatar()
+
+    const zip = new JSZip()
+    const filenameMap = new Map<string, number>()
+    const enableThinking = ScriptStorage.get<boolean>(KEY_THINKING_ENABLED) ?? false
+    const conversations = apiConversations.map(x => processConversation(x, { enableThinking }))
+    conversations.forEach((conversation) => {
+        let fileName = getFileNameWithFormat(fileNameFormat, 'html', {
+            title: conversation.title,
+            chatId: conversation.id,
+            createTime: conversation.createTime,
+            updateTime: conversation.updateTime,
+        })
+        if (filenameMap.has(fileName)) {
+            const count = filenameMap.get(fileName) ?? 1
+            filenameMap.set(fileName, count + 1)
+            fileName = `${fileName.slice(0, -5)} (${count}).html`
+        }
+        else {
+            filenameMap.set(fileName, 1)
+        }
+        const content = conversationToHtml(conversation, userAvatar, metaList)
+        zip.file(fileName, content)
+    })
+
+    const blob = await zip.generateAsync({
+        type: 'blob',
+        // A DOS-made zip makes macOS `unzip` garble non-ASCII file names
+        platform: 'UNIX',
+        compression: 'DEFLATE',
+        compressionOptions: {
+            level: 9,
+        },
+    })
+    const partInfo: PartInfo | undefined = (partIndex != null && totalParts != null)
+        ? { part: partIndex, total: totalParts }
+        : undefined
+    downloadFile(buildZipFileName('html', projectName, partInfo), 'application/zip', blob)
+
+    return true
+}
+
+function conversationToHtml(conversation: ConversationResult, avatar: string, metaList?: ExportMeta[]) {
+    const { id, title, conversationNodes } = conversation
+
+    const enableTimestamp = ScriptStorage.get<boolean>(KEY_TIMESTAMP_ENABLED) ?? false
+    const timeStampHtml = ScriptStorage.get<boolean>(KEY_TIMESTAMP_HTML) ?? false
+    const timeStamp24H = ScriptStorage.get<boolean>(KEY_TIMESTAMP_24H) ?? false
+    const enableSources = ScriptStorage.get<boolean>(KEY_SOURCES_ENABLED) ?? true
+
+    const conversationHtml = conversationNodes.map(({ message, thinking }) => {
+        if (!message || !message.content) return null
+
+        if (shouldSkipMessageInExport(message)) return null
+
+        const author = transformAuthor(message.author)
+        const authorType = message.author.role === 'user' ? 'user' : 'assistant'
+        const avatarEl = message.author.role === 'user'
+            ? `<img alt="${escapeHtml(author)}" />`
+            : '<svg width="41" height="41"><use xlink:href="#chatgpt" /></svg>'
+
+        let postSteps: Array<(input: string) => string> = []
+        if (message.author.role === 'assistant') {
+            // Handle old-style footnotes (【11†(PrintWiki)】 format)
+            postSteps.push(input => transformFootNotes(input, message.metadata))
+            // Handle new-style content references (web search citations with Unicode markers)
+            postSteps.push(input => transformContentReferences(input, message.metadata, {
+                includeSourceList: enableSources,
+                sourceListLabel: i18n.t('Sources'),
+            }))
+
+            postSteps.push(renderMarkdownHtml)
+        }
+        else {
+            // Only assistant replies are markdown. A tool message can hold an uploaded HTML page.
+            postSteps = [input => `<p class="no-katex">${escapeHtml(input)}</p>`]
+        }
+        const postProcess = (input: string) => postSteps.reduce((acc, fn) => fn(acc), input)
+        const content = transformContent(message.content, message.metadata, postProcess)
+        const attachments = getFileAttachmentNames(message)
+        const attachmentsHtml = attachments.length
+            ? `<ul class="attachments">${attachments.map(name => `<li>📎 ${escapeHtml(name)}</li>`).join('')}</ul>`
+            : ''
+
+        const timestamp = message?.create_time ?? ''
+        const showTimestamp = enableTimestamp && timeStampHtml && timestamp
+        let timestampHtml = ''
+        let conversationTime = ''
+
+        if (showTimestamp) {
+            const date = new Date(timestamp * 1000)
+            // format: 20:12 / 08:12 PM
+            conversationTime = date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: !timeStamp24H })
+            timestampHtml = `<time class="time" datetime="${date.toISOString()}" title="${date.toLocaleString()}">${conversationTime}</time>`
+        }
+
+        const thinkingBlock = thinking ? formatThinkingHtml(thinking) : ''
+
+        return `
+<div class="conversation-item">
+    <div class="author ${authorType}">
+        ${avatarEl}
+    </div>
+    <div class="conversation-content-wrapper">
+        ${thinkingBlock}
+        <div class="conversation-content">
+            ${content}
+            ${attachmentsHtml}
+        </div>
+    </div>
+    ${timestampHtml}
+</div>`
+    }).filter(Boolean).join('\n\n')
+
+    const date = dateStr()
+    const time = new Date().toISOString()
+    const source = `${baseUrl}/c/${id}`
+    const lang = document.documentElement.lang ?? 'en'
+    const theme = getColorScheme()
+
+    const _metaList = resolveMetaList(metaList, getMetaVariables(conversation, source, date))
+
+    return fillTemplate(templateHtml, {
+        title: escapeHtml(title),
+        date,
+        time,
+        source: escapeHtml(source),
+        lang: escapeHtml(lang),
+        theme: escapeHtml(theme),
+        avatar,
+        details: metaDetailsHtml(_metaList),
+        content: conversationHtml,
+    })
+}
+
+/**
+ * Transform foot notes in assistant's message
+ */
+function transformFootNotes(
+    input: string,
+    metadata: ConversationNodeMessage['metadata'],
+) {
+    // 【11†(PrintWiki)】
+    const footNoteMarkRegex = /【(\d+)†\((.+?)\)】/g
+    return input.replace(footNoteMarkRegex, (match, citeIndex, _evidenceText) => {
+        const citation = metadata?.citations?.find(cite => cite.metadata?.extra?.cited_message_idx === +citeIndex)
+        // We simply remove the foot note mark in html output
+        if (citation) return ''
+
+        return match
+    })
+}
+
+/**
+ * Convert the content based on the type of message
+ */
+function transformContent(
+    content: ConversationNodeMessage['content'],
+    metadata: ConversationNodeMessage['metadata'],
+    postProcess: (input: string) => string,
+) {
+    switch (content.content_type) {
+        case 'text':
+            return postProcess(content.parts?.join('\n') || '')
+        case 'code':
+            return postProcess(`Code:\n\`\`\`\n${content.text}\n\`\`\``)
+        case 'execution_output':
+            if (metadata?.aggregate_result?.messages) {
+                return metadata.aggregate_result.messages
+                    .filter(msg => msg.message_type === 'image')
+                    .map(msg => `<img src="${escapeHtml(msg.image_url)}" height="${escapeHtml(String(msg.height))}" width="${escapeHtml(String(msg.width))}" decoding="async" />`)
+                    .join('\n')
+            }
+            return postProcess(`Result:\n\`\`\`\n${content.text}\n\`\`\`` || '')
+        case 'tether_quote':
+            return postProcess(`> ${content.title || content.text || ''}`)
+        case 'tether_browsing_code':
+            return postProcess('') // TODO: implement
+        case 'tether_browsing_display': {
+            const metadataList = metadata?._cite_metadata?.metadata_list
+            if (Array.isArray(metadataList) && metadataList.length > 0) {
+                return postProcess(metadataList.map(({ title, url }) => {
+                    return `> [${title}](${url})`
+                }).join('\n'))
+            }
+            return postProcess('')
+        }
+        case 'multimodal_text': {
+            return content.parts?.map((part) => {
+                if (typeof part === 'string') return postProcess(part)
+                if (part.content_type === 'image_asset_pointer') return `<img src="${escapeHtml(part.asset_pointer)}" height="${escapeHtml(String(part.height))}" width="${escapeHtml(String(part.width))}" decoding="async" />`
+                if (part.content_type === 'audio_transcription') return `<div style="font-style: italic; opacity: 0.65;">“${escapeHtml(part.text)}”</div>`
+                if (part.content_type === 'audio_asset_pointer') return null
+                if (part.content_type === 'real_time_user_audio_video_asset_pointer') return null
+                return postProcess('[Unsupported multimodal content]')
+            }).join('\n') || ''
+        }
+        default:
+            console.warn('[Exporter] Unsupported Content:', content.content_type, content)
+            return postProcess(`[Unsupported Content: ${content.content_type} ]`)
+    }
+}
+
+function renderMarkdownHtml(input: string): string {
+    const { text, restore } = protectMath(input)
+    return restore(toHtml(text), formula => escapeHtml(toBracketDelimiters(formula)))
+}
+
+function formatThinkingHtml(thinking: ThinkingContent): string {
+    const duration = thinking.durationSeconds == null ? null : formatDurationSeconds(thinking.durationSeconds)
+    const durationLabel = duration == null ? i18n.t('Thinking') : i18n.t('Thought for {{duration}} seconds', { duration })
+
+    const parts: string[] = []
+
+    if (thinking.activities?.length) {
+        const items = thinking.activities.map(a => `<li>${escapeHtml(a)}</li>`).join('')
+        parts.push(`<ul>${items}</ul>`)
+    }
+
+    const thoughts = thinking.thoughts
+        .map(t => t.content || t.summary)
+        .filter(Boolean)
+        .map(renderMarkdownHtml)
+        .join('\n')
+    if (thoughts) parts.push(thoughts)
+
+    const body = parts.join('\n')
+
+    if (!body) return ''
+
+    return `<details class="thinking"><summary>${escapeHtml(durationLabel)}</summary><div class="thinking-content">${body}</div></details>`
+}
